@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__github__get_file_contents",
+      "Bash(dir \"D:\\\\尚硅谷JAVA\\\\ifow2api\")",
+      "Bash(pip install -r requirements.txt)",
+      "Bash(python main.py)",
+      "Bash(timeout 3 curl -s http://localhost:8000/v1/models)",
+      "Bash(curl -s -X POST http://localhost:8000/v1/chat/completions -H \"Content-Type: application/json\" -d \"{\"\"model\"\":\"\"glm-4.6\"\",\"\"messages\"\":[{\"\"role\"\":\"\"user\"\",\"\"content\"\":\"\"say hi\"\"}],\"\"max_tokens\"\":50}\")",
+      "Bash(curl -s -X POST http://localhost:8000/v1/messages -H \"Content-Type: application/json\" -d \"{\"\"model\"\":\"\"glm-4.6\"\",\"\"max_tokens\"\":50,\"\"messages\"\":[{\"\"role\"\":\"\"user\"\",\"\"content\"\":\"\"say hi\"\"}]}\")",
+      "Bash(pip install flet -q)"
+    ]
+  }
+}
