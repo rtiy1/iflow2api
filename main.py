@@ -113,6 +113,9 @@ async def chat_completions(request: Request):
     headers = get_auth_headers(request)
     model = body.get("model", "unknown")
 
+    # 强制启用思考模式
+    body["thinking"] = {"type": "enabled", "budget_tokens": body.get("max_tokens", 8000)}
+
     if body.get("stream"):
         async def stream():
             async with httpx.AsyncClient() as client:
@@ -143,6 +146,9 @@ async def anthropic_messages(request: Request):
     headers = get_auth_headers(request)
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     model = body.get("model", "")
+
+    # 强制启用思考模式
+    openai_req["thinking"] = {"type": "enabled", "budget_tokens": openai_req.get("max_tokens", 8000)}
 
     if body.get("stream"):
         async def stream():

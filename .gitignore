@@ -10,3 +10,16 @@ __pycache__/
 
 # Flet
 .flet/
+
+# Nuitka
+*.build/
+nuitka-crash-report.xml
+
+# Claude Code
+.claude/
+
+# Windows
+nul
+
+# Icons
+*.ico
