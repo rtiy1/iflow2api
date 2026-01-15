@@ -17,8 +17,7 @@ from converters import (
     anthropic_to_openai,
     openai_to_anthropic,
     make_anthropic_stream_events,
-    convert_openai_chunk_to_anthropic,
-    make_anthropic_stream_end,
+    StreamConverter,
 )
 
 app = FastAPI()
@@ -149,14 +148,14 @@ async def anthropic_messages(request: Request):
         async def stream():
             for event in make_anthropic_stream_events(model, msg_id):
                 yield event
+            converter = StreamConverter()
             async with httpx.AsyncClient() as client:
                 async with client.stream("POST", f"{IFLOW_URL}/chat/completions", json=openai_req, headers=headers, timeout=120) as resp:
                     async for line in resp.aiter_lines():
                         if line:
-                            converted = convert_openai_chunk_to_anthropic(line)
-                            if converted:
-                                yield converted
-            for event in make_anthropic_stream_end():
+                            for event in converter.convert_chunk(line):
+                                yield event
+            for event in converter.finish():
                 yield event
         return StreamingResponse(stream(), media_type="text/event-stream")
 
