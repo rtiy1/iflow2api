@@ -111,6 +111,10 @@ def openai_to_anthropic(resp: dict) -> dict:
 
     content = []
 
+    # 添加 thinking 内容
+    if message.get("reasoning_content"):
+        content.append({"type": "thinking", "thinking": message["reasoning_content"]})
+
     # 添加文本内容
     if message.get("content"):
         content.append({"type": "text", "text": message["content"]})
@@ -163,7 +167,10 @@ class StreamConverter:
         self.content_index = 0
         self.tool_calls = {}  # id -> {name, arguments}
         self.text_started = False
+        self.thinking_started = False
         self.current_tool_index = None
+        self.input_tokens = 0
+        self.output_tokens = 0
 
     def convert_chunk(self, line: str) -> list:
         """转换单个 OpenAI chunk 到 Anthropic 事件列表"""
@@ -177,10 +184,30 @@ class StreamConverter:
 
         events = []
         delta = data.get("choices", [{}])[0].get("delta", {})
+        usage = data.get("usage", {})
+
+        # 收集 token 使用信息
+        if usage:
+            self.input_tokens = usage.get("prompt_tokens", self.input_tokens)
+            self.output_tokens = usage.get("completion_tokens", self.output_tokens)
+
+        # 处理 thinking 内容
+        reasoning = delta.get("reasoning_content", "")
+        if reasoning:
+            if not self.thinking_started:
+                events.append(f'event: content_block_start\ndata: {json.dumps({"type": "content_block_start", "index": self.content_index, "content_block": {"type": "thinking", "thinking": ""}})}\n\n')
+                self.thinking_started = True
+            events.append(f'event: content_block_delta\ndata: {json.dumps({"type": "content_block_delta", "index": self.content_index, "delta": {"type": "thinking_delta", "thinking": reasoning}})}\n\n')
 
         # 处理文本内容
         text = delta.get("content", "")
         if text:
+            # 关闭 thinking 块
+            if self.thinking_started:
+                events.append(f'event: content_block_stop\ndata: {json.dumps({"type": "content_block_stop", "index": self.content_index})}\n\n')
+                self.content_index += 1
+                self.thinking_started = False
+
             if not self.text_started:
                 events.append(f'event: content_block_start\ndata: {json.dumps({"type": "content_block_start", "index": self.content_index, "content_block": {"type": "text", "text": ""}})}\n\n')
                 self.text_started = True
@@ -194,11 +221,12 @@ class StreamConverter:
             func = tc.get("function", {})
 
             if tc_id:  # 新工具调用开始
-                # 关闭之前的文本块
-                if self.text_started:
+                # 关闭之前的块
+                if self.thinking_started or self.text_started:
                     events.append(f'event: content_block_stop\ndata: {json.dumps({"type": "content_block_stop", "index": self.content_index})}\n\n')
                     self.content_index += 1
                     self.text_started = False
+                    self.thinking_started = False
 
                 self.tool_calls[tc_index] = {"id": tc_id, "name": func.get("name", ""), "arguments": ""}
                 self.current_tool_index = tc_index
@@ -216,8 +244,12 @@ class StreamConverter:
     def finish(self) -> list:
         """生成结束事件"""
         events = []
-        if self.text_started or self.tool_calls:
+        if self.text_started or self.thinking_started or self.tool_calls:
             events.append(f'event: content_block_stop\ndata: {json.dumps({"type": "content_block_stop", "index": self.content_index})}\n\n')
+
+        # 添加 usage 事件
+        if self.input_tokens or self.output_tokens:
+            events.append(f'event: message_delta\ndata: {json.dumps({"type": "message_delta", "usage": {"output_tokens": self.output_tokens}})}\n\n')
 
         stop_reason = "tool_use" if self.tool_calls else "end_turn"
         events.extend(make_anthropic_stream_end(stop_reason))

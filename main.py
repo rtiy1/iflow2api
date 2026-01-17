@@ -457,10 +457,14 @@ async def chat_completions(request: Request):
     model = body.get("model", "unknown")
     # 设置合理的 max_tokens 下限，但尊重客户端设置
     body["max_tokens"] = max(body.get("max_tokens", 4096), 1024)
-    body["thinking"] = {"type": "enabled", "budget_tokens": body.get("max_tokens", 8000)}
+    # 只在客户端未指定时才添加 thinking 配置
+    if "thinking" not in body:
+        body["thinking"] = {"type": "enabled", "budget_tokens": body.get("max_tokens", 8000)}
+    logger.info(f"Request model={model}, thinking={body.get('thinking')}, has_tools={bool(body.get('tools'))}")
 
     try:
         if body.get("stream"):
+            body["stream_options"] = {"include_usage": True}
             import json as _json
             reasoning_parts = []
             content_parts = []
@@ -474,9 +478,11 @@ async def chat_completions(request: Request):
                                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                                     if delta.get("reasoning_content"):
                                         reasoning_parts.append(delta["reasoning_content"])
+                                        logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
                                     if delta.get("content"):
                                         content_parts.append(delta["content"])
-                                except: pass
+                                except Exception as e:
+                                    logger.warning(f"Parse chunk error: {e}")
                             if line:
                                 yield line + "\n\n"
                 request_logs.appendleft({
@@ -489,6 +495,7 @@ async def chat_completions(request: Request):
         async with httpx.AsyncClient() as client:
             resp = await retry_request(client, "post", f"{IFLOW_URL}/chat/completions", json=body, headers=headers, timeout=120)
             data = resp.json()
+            logger.info(f"Non-stream response usage: {data.get('usage')}")
             reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             request_logs.appendleft({
@@ -505,6 +512,32 @@ async def chat_completions(request: Request):
         stats["total"] += 1; stats["error"] += 1
         return make_openai_error(500, str(e), "internal_error")
 
+@app.post("/v1/messages/count_tokens")
+async def count_tokens(request: Request):
+    try:
+        body = await request.json()
+    except:
+        return make_anthropic_error(400, "Invalid JSON", "invalid_request_error")
+
+    # 简单估算：每个字符约 0.25 token
+    def estimate_tokens(text: str) -> int:
+        return max(1, int(len(text) * 0.25))
+
+    total = 0
+    if body.get("system"):
+        total += estimate_tokens(body["system"])
+
+    for msg in body.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += estimate_tokens(content)
+        elif isinstance(content, list):
+            for block in content:
+                if block.get("type") == "text":
+                    total += estimate_tokens(block.get("text", ""))
+
+    return {"input_tokens": total}
+
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     try:
@@ -517,10 +550,14 @@ async def anthropic_messages(request: Request):
     model = body.get("model", "")
     # 设置合理的 max_tokens 下限，但尊重客户端设置
     openai_req["max_tokens"] = max(openai_req.get("max_tokens", 4096), 1024)
-    openai_req["thinking"] = {"type": "enabled", "budget_tokens": openai_req.get("max_tokens", 8000)}
+    # 只在客户端未指定时才添加 thinking 配置
+    if "thinking" not in openai_req:
+        openai_req["thinking"] = {"type": "enabled", "budget_tokens": openai_req.get("max_tokens", 8000)}
+    logger.info(f"Request model={model}, thinking={openai_req.get('thinking')}, has_tools={bool(openai_req.get('tools'))}")
 
     try:
         if body.get("stream"):
+            openai_req["stream_options"] = {"include_usage": True}
             import json as _json
             reasoning_parts = []
             content_parts = []
@@ -537,9 +574,11 @@ async def anthropic_messages(request: Request):
                                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                                     if delta.get("reasoning_content"):
                                         reasoning_parts.append(delta["reasoning_content"])
+                                        logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
                                     if delta.get("content"):
                                         content_parts.append(delta["content"])
-                                except: pass
+                                except Exception as e:
+                                    logger.warning(f"Parse chunk error: {e}")
                             if line:
                                 for event in converter.convert_chunk(line):
                                     yield event
@@ -555,6 +594,7 @@ async def anthropic_messages(request: Request):
         async with httpx.AsyncClient() as client:
             resp = await retry_request(client, "post", f"{IFLOW_URL}/chat/completions", json=openai_req, headers=headers, timeout=120)
             data = resp.json()
+            logger.info(f"Non-stream response usage: {data.get('usage')}")
             reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             request_logs.appendleft({
