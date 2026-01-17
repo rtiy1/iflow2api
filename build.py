@@ -19,8 +19,8 @@ def main():
         run(f"{sys.executable} -m venv {VENV_DIR}")
 
     # Install dependencies
-    pip = f"{VENV_DIR}/Scripts/pip.exe"
-    python = f"{VENV_DIR}/Scripts/python.exe"
+    pip = str(Path(VENV_DIR) / "Scripts" / "pip.exe")
+    python = str(Path(VENV_DIR) / "Scripts" / "python.exe")
 
     print("Installing dependencies...")
     run(f"{pip} install -r requirements.txt")
@@ -43,8 +43,8 @@ def main():
     run(" ".join(cmd))
 
     # Run UPX if available
-    upx_path = Path("upx-4.2.4-win64/upx.exe")
-    exe_path = Path(f"dist/{OUTPUT_NAME}.exe")
+    upx_path = Path("upx-4.2.4-win64") / "upx.exe"
+    exe_path = Path("dist") / f"{OUTPUT_NAME}.exe"
 
     if upx_path.exists() and exe_path.exists():
         print("Running UPX compression...")
