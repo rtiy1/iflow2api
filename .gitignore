@@ -7,12 +7,14 @@ dist/
 __pycache__/
 *.pyc
 *.pyo
+venv_nuitka/
 
 # Flet
 .flet/
 
 # Nuitka
 *.build/
+*.dist/
 nuitka-crash-report.xml
 
 # Claude Code
@@ -23,3 +25,13 @@ nul
 
 # Icons
 *.ico
+
+# Tools
+upx-*.zip
+upx-*/
+
+# Go project
+iflow2api-go/
+
+# Screenshots
+*.png
