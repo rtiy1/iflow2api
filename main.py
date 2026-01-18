@@ -1,5 +1,4 @@
 import uuid
-import httpx
 import logging
 import asyncio
 from datetime import datetime
@@ -8,6 +7,7 @@ from collections import deque
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from config import CONFIG
+from proxy import get_proxy
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -23,7 +23,6 @@ from converters import (
 )
 
 app = FastAPI()
-IFLOW_URL = CONFIG["base_url"]
 
 def make_openai_error(status: int, message: str, err_type: str = "api_error"):
     return JSONResponse({"error": {"message": message, "type": err_type, "code": status}}, status_code=status)
@@ -31,73 +30,9 @@ def make_openai_error(status: int, message: str, err_type: str = "api_error"):
 def make_anthropic_error(status: int, message: str, err_type: str = "api_error"):
     return JSONResponse({"type": "error", "error": {"type": err_type, "message": message}}, status_code=status)
 
-# 重试配置
-MAX_RETRIES = 3
-RETRY_DELAYS = [1, 2, 4]
-
-async def retry_request(client, method, url, **kwargs):
-    """带重试的非流式请求"""
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = await getattr(client, method)(url, **kwargs)
-            if resp.status_code >= 500 and attempt < MAX_RETRIES - 1:
-                logger.warning(f"HTTP {resp.status_code}, 重试 {attempt+1}/{MAX_RETRIES}")
-                await asyncio.sleep(RETRY_DELAYS[attempt])
-                continue
-            return resp
-        except (httpx.ConnectError, httpx.TimeoutException) as e:
-            if attempt < MAX_RETRIES - 1:
-                logger.warning(f"{type(e).__name__}, 重试 {attempt+1}/{MAX_RETRIES}")
-                await asyncio.sleep(RETRY_DELAYS[attempt])
-            else:
-                raise
-
-@asynccontextmanager
-async def retry_stream(client, method, url, **kwargs):
-    """带重试的流式请求"""
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with client.stream(method, url, **kwargs) as resp:
-                if resp.status_code >= 500 and attempt < MAX_RETRIES - 1:
-                    logger.warning(f"HTTP {resp.status_code}, 重试 {attempt+1}/{MAX_RETRIES}")
-                    await asyncio.sleep(RETRY_DELAYS[attempt])
-                    continue
-                yield resp
-                return
-        except (httpx.ConnectError, httpx.TimeoutException) as e:
-            if attempt >= MAX_RETRIES - 1:
-                raise
-            logger.warning(f"{type(e).__name__}, 重试 {attempt+1}/{MAX_RETRIES}")
-            await asyncio.sleep(RETRY_DELAYS[attempt])
-
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    start = datetime.now()
-    headers = dict(request.headers) if not request.url.path.startswith("/admin") else {}
-    body_for_log = None
-    if request.method == "POST" and not request.url.path.startswith("/admin"):
-        full_body = await request.body()
-        body_for_log = full_body.decode("utf-8", errors="ignore")[:8000]
-        # 保留完整请求体供后续处理
-        async def receive():
-            return {"type": "http.request", "body": full_body}
-        request = Request(request.scope, receive)
-
     response = await call_next(request)
-    if not request.url.path.startswith("/admin") and request.url.path not in ["/v1/chat/completions", "/v1/messages"]:
-        stats["total"] += 1
-        if response.status_code < 400:
-            stats["success"] += 1
-        else:
-            stats["error"] += 1
-        request_logs.appendleft({
-            "time": start.strftime("%H:%M:%S"),
-            "method": request.method,
-            "path": request.url.path,
-            "status": response.status_code,
-            "headers": headers,
-            "body": body_for_log
-        })
     return response
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -424,92 +359,75 @@ async def clear_logs():
     stats["total"] = stats["success"] = stats["error"] = 0
     return {"status": "ok"}
 
-HEADERS = {
-    "user-agent": "iFlow-Cli",
-    "Content-Type": "application/json",
-}
-
-def get_auth_headers(request: Request):
-    # 始终使用配置文件的 API key，忽略客户端传来的
-    return {**HEADERS, "Authorization": f"Bearer {CONFIG['api_key']}"}
-
 @app.get("/v1/models")
 async def models(request: Request):
-    # iFlow CLI 支持的模型列表 (硬编码，因为 API 不返回完整列表)
-    model_list = [
-        "glm-4.7", "iFlow-ROME-30BA3B", "deepseek-v3.2-chat", "qwen3-coder-plus",
-        "kimi-k2-thinking", "minimax-m2.1", "kimi-k2-0905", "glm-4.6",
-        "deepseek-r1", "deepseek-v3", "qwen3-max", "qwen3-235b"
-    ]
-    import time
-    return {
-        "object": "list",
-        "data": [{"id": m, "object": "model", "created": int(time.time()), "owned_by": "iflow"} for m in model_list]
-    }
+    proxy = get_proxy()
+    return await proxy.get_models()
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
-        body = await request.json()
-    except:
+        body_bytes = await request.body()
+        import json
+        body = json.loads(body_bytes.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        return make_openai_error(400, f"Invalid JSON: {e}", "invalid_request_error")
+    except Exception as e:
         return make_openai_error(400, "Invalid JSON", "invalid_request_error")
-    headers = get_auth_headers(request)
+
     model = body.get("model", "unknown")
-    # 设置合理的 max_tokens 下限，但尊重客户端设置
     body["max_tokens"] = max(body.get("max_tokens", 4096), 1024)
-    # 只在客户端未指定时才添加 thinking 配置
-    if "thinking" not in body:
-        body["thinking"] = {"type": "enabled", "budget_tokens": body.get("max_tokens", 8000)}
     logger.info(f"Request model={model}, thinking={body.get('thinking')}, has_tools={bool(body.get('tools'))}")
 
     try:
+        proxy = get_proxy()
+
         if body.get("stream"):
             body["stream_options"] = {"include_usage": True}
             import json as _json
             reasoning_parts = []
             content_parts = []
+
             async def stream():
-                async with httpx.AsyncClient() as client:
-                    async with retry_stream(client, "POST", f"{IFLOW_URL}/chat/completions", json=body, headers=headers, timeout=120) as resp:
-                        async for line in resp.aiter_lines():
-                            if line and line.startswith("data: ") and not line.endswith("[DONE]"):
-                                try:
-                                    chunk = _json.loads(line[6:])
-                                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                                    if delta.get("reasoning_content"):
-                                        reasoning_parts.append(delta["reasoning_content"])
-                                        logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
-                                    if delta.get("content"):
-                                        content_parts.append(delta["content"])
-                                except Exception as e:
-                                    logger.warning(f"Parse chunk error: {e}")
-                            if line:
-                                yield line + "\n\n"
+                async for chunk in await proxy.chat_completions(body, stream=True):
+                    line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                    if line and line.startswith("data: ") and not line.endswith("[DONE]"):
+                        try:
+                            data = _json.loads(line[6:])
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            if delta.get("reasoning_content"):
+                                reasoning_parts.append(delta["reasoning_content"])
+                                logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
+                            if delta.get("content"):
+                                content_parts.append(delta["content"])
+                        except Exception as e:
+                            logger.warning(f"Parse chunk error: {e}")
+                    if line:
+                        yield line if line.endswith("\n\n") else line + "\n\n"
+
                 request_logs.appendleft({
                     "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/chat/completions",
                     "status": 200, "model": model, "reasoning": "".join(reasoning_parts)[:3000], "content": "".join(content_parts)[:1000]
                 })
-                stats["total"] += 1; stats["success"] += 1
+                stats["total"] += 1
+                stats["success"] += 1
+
             return StreamingResponse(stream(), media_type="text/event-stream")
 
-        async with httpx.AsyncClient() as client:
-            resp = await retry_request(client, "post", f"{IFLOW_URL}/chat/completions", json=body, headers=headers, timeout=120)
-            data = resp.json()
-            logger.info(f"Non-stream response usage: {data.get('usage')}")
-            reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            request_logs.appendleft({
-                "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/chat/completions",
-                "status": resp.status_code, "model": model, "reasoning": reasoning[:3000], "content": content[:1000]
-            })
-            stats["total"] += 1
-            stats["success" if resp.status_code < 400 else "error"] += 1
-            return data
-    except (httpx.ConnectError, httpx.TimeoutException) as e:
-        stats["total"] += 1; stats["error"] += 1
-        return make_openai_error(503, f"Upstream service unavailable: {type(e).__name__}", "service_unavailable")
+        data = await proxy.chat_completions(body, stream=False)
+        logger.info(f"Non-stream response usage: {data.get('usage')}")
+        reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        request_logs.appendleft({
+            "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/chat/completions",
+            "status": 200, "model": model, "reasoning": reasoning[:3000], "content": content[:1000]
+        })
+        stats["total"] += 1
+        stats["success"] += 1
+        return data
     except Exception as e:
-        stats["total"] += 1; stats["error"] += 1
+        stats["total"] += 1
+        stats["error"] += 1
         return make_openai_error(500, str(e), "internal_error")
 
 @app.post("/v1/messages/count_tokens")
@@ -541,74 +459,74 @@ async def count_tokens(request: Request):
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     try:
-        body = await request.json()
-    except:
+        body_bytes = await request.body()
+        import json
+        body = json.loads(body_bytes.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        return make_anthropic_error(400, f"Invalid JSON: {e}", "invalid_request_error")
+    except Exception as e:
         return make_anthropic_error(400, "Invalid JSON", "invalid_request_error")
+
     openai_req = anthropic_to_openai(body)
-    headers = get_auth_headers(request)
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     model = body.get("model", "")
-    # 设置合理的 max_tokens 下限，但尊重客户端设置
     openai_req["max_tokens"] = max(openai_req.get("max_tokens", 4096), 1024)
-    # 只在客户端未指定时才添加 thinking 配置
-    if "thinking" not in openai_req:
-        openai_req["thinking"] = {"type": "enabled", "budget_tokens": openai_req.get("max_tokens", 8000)}
     logger.info(f"Request model={model}, thinking={openai_req.get('thinking')}, has_tools={bool(openai_req.get('tools'))}")
 
     try:
+        proxy = get_proxy()
+
         if body.get("stream"):
             openai_req["stream_options"] = {"include_usage": True}
             import json as _json
             reasoning_parts = []
             content_parts = []
+
             async def stream():
                 for event in make_anthropic_stream_events(model, msg_id):
                     yield event
                 converter = StreamConverter()
-                async with httpx.AsyncClient() as client:
-                    async with retry_stream(client, "POST", f"{IFLOW_URL}/chat/completions", json=openai_req, headers=headers, timeout=120) as resp:
-                        async for line in resp.aiter_lines():
-                            if line and line.startswith("data: ") and not line.endswith("[DONE]"):
-                                try:
-                                    chunk = _json.loads(line[6:])
-                                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                                    if delta.get("reasoning_content"):
-                                        reasoning_parts.append(delta["reasoning_content"])
-                                        logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
-                                    if delta.get("content"):
-                                        content_parts.append(delta["content"])
-                                except Exception as e:
-                                    logger.warning(f"Parse chunk error: {e}")
-                            if line:
-                                for event in converter.convert_chunk(line):
-                                    yield event
+                async for chunk in await proxy.chat_completions(openai_req, stream=True):
+                    line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                    if line and line.startswith("data: ") and not line.endswith("[DONE]"):
+                        try:
+                            data = _json.loads(line[6:])
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            if delta.get("reasoning_content"):
+                                reasoning_parts.append(delta["reasoning_content"])
+                                logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
+                            if delta.get("content"):
+                                content_parts.append(delta["content"])
+                        except Exception as e:
+                            logger.warning(f"Parse chunk error: {e}")
+                    if line:
+                        for event in converter.convert_chunk(line):
+                            yield event
                 for event in converter.finish():
                     yield event
                 request_logs.appendleft({
                     "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/messages",
                     "status": 200, "model": model, "reasoning": "".join(reasoning_parts)[:3000], "content": "".join(content_parts)[:1000]
                 })
-                stats["total"] += 1; stats["success"] += 1
+                stats["total"] += 1
+                stats["success"] += 1
+
             return StreamingResponse(stream(), media_type="text/event-stream")
 
-        async with httpx.AsyncClient() as client:
-            resp = await retry_request(client, "post", f"{IFLOW_URL}/chat/completions", json=openai_req, headers=headers, timeout=120)
-            data = resp.json()
-            logger.info(f"Non-stream response usage: {data.get('usage')}")
-            reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            request_logs.appendleft({
-                "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/messages",
-                "status": resp.status_code, "model": model, "reasoning": reasoning[:3000], "content": content[:1000]
-            })
-            stats["total"] += 1
-            stats["success" if resp.status_code < 400 else "error"] += 1
-            return JSONResponse(openai_to_anthropic(data))
-    except (httpx.ConnectError, httpx.TimeoutException) as e:
-        stats["total"] += 1; stats["error"] += 1
-        return make_anthropic_error(503, f"Upstream service unavailable: {type(e).__name__}", "service_unavailable")
+        data = await proxy.chat_completions(openai_req, stream=False)
+        logger.info(f"Non-stream response usage: {data.get('usage')}")
+        reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        request_logs.appendleft({
+            "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/messages",
+            "status": 200, "model": model, "reasoning": reasoning[:3000], "content": content[:1000]
+        })
+        stats["total"] += 1
+        stats["success"] += 1
+        return JSONResponse(openai_to_anthropic(data))
     except Exception as e:
-        stats["total"] += 1; stats["error"] += 1
+        stats["total"] += 1
+        stats["error"] += 1
         return make_anthropic_error(500, str(e), "internal_error")
 
 if __name__ == "__main__":

@@ -35,3 +35,7 @@ iflow2api-go/
 
 # Screenshots
 *.png
+
+# Logs
+*.log
+server.log

@@ -1,4 +1,4 @@
 fastapi
 uvicorn
 httpx
-flet
+PyQt5
