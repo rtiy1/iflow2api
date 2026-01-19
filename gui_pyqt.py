@@ -252,12 +252,21 @@ class ServerWorker(QThread):
 
     def run(self):
         """线程运行入口"""
+        # 先检查端口是否可用
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('0.0.0.0', self.port))
+        except OSError:
+            self.server_error.emit(f"端口 {self.port} 已被占用，请更换端口或关闭占用该端口的程序")
+            return
+
         self._is_running = True
         try:
             config = uvicorn.Config(app, host="0.0.0.0", port=self.port, log_config=None)
             self.server = uvicorn.Server(config)
 
-            # 标记服务器已启动（在实际运行前）
+            # 标记服务器已启动
             self.server_started.emit()
 
             # 运行服务器（会阻塞直到服务器停止）
