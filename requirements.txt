@@ -2,3 +2,4 @@ fastapi
 uvicorn
 httpx
 PyQt5
+psutil

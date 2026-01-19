@@ -3,7 +3,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QFrame, QGridLayout,
     QProgressBar, QSizePolicy, QScrollArea, QTextEdit,
-    QGraphicsDropShadowEffect
+    QGraphicsDropShadowEffect, QDialog
 )
 from PyQt5.QtCore import (
     Qt, QTimer, QSize, pyqtSignal, pyqtSlot, QThread, QPoint
@@ -14,8 +14,14 @@ import threading
 import asyncio
 import uvicorn
 import webbrowser
+import platform
+import psutil
+import os
+import time
 from datetime import datetime
 from main import app, request_logs, stats, CONFIG
+
+start_time = time.time()
 
 # ==============================
 # 常量定义（统一管理，便于维护）
@@ -503,22 +509,34 @@ class MainWindow(QMainWindow):
         self.btn_clear.clicked.connect(self.clear_logs)
         self.btn_clear.setProperty("class", "ActionBtn")
 
+        self.btn_oauth = QPushButton("OAuth认证")
+        self.btn_oauth.clicked.connect(self.start_oauth)
+        self.btn_oauth.setProperty("class", "ActionBtn")
+
+        self.btn_health = QPushButton("健康检查")
+        self.btn_health.clicked.connect(self.check_health)
+        self.btn_health.setProperty("class", "ActionBtn")
+
+        self.btn_sysinfo = QPushButton("系统信息")
+        self.btn_sysinfo.clicked.connect(self.show_system_info)
+        self.btn_sysinfo.setProperty("class", "ActionBtn")
+
+        self.btn_api = QPushButton("API示例")
+        self.btn_api.clicked.connect(self.show_api_examples)
+        self.btn_api.setProperty("class", "ActionBtn")
+
         self.btn_github = QPushButton("GitHub")
         self.btn_github.clicked.connect(lambda: webbrowser.open("https://github.com/rtiy1/ifow2api"))
         self.btn_github.setProperty("class", "ActionBtn")
-
-        self.btn_help = QPushButton("教程")
-        self.btn_help.setProperty("class", "ActionBtn")
-
-        self.btn_config = QPushButton("配置")
-        self.btn_config.setProperty("class", "ActionBtn")
 
         # 将按钮添加到布局
         btn_layout.addWidget(self.btn_start)
         btn_layout.addWidget(self.btn_admin)
         btn_layout.addWidget(self.btn_clear)
-        btn_layout.addWidget(self.btn_config)
-        btn_layout.addWidget(self.btn_help)
+        btn_layout.addWidget(self.btn_oauth)
+        btn_layout.addWidget(self.btn_health)
+        btn_layout.addWidget(self.btn_sysinfo)
+        btn_layout.addWidget(self.btn_api)
         btn_layout.addWidget(self.btn_github)
 
         parent_layout.addWidget(btn_container)
@@ -665,6 +683,123 @@ class MainWindow(QMainWindow):
         self.update_stats()
         self.log_text.setText("日志已清空 / Logs cleared")
         self.last_log = ""
+
+    @pyqtSlot()
+    def start_oauth(self):
+        """启动 OAuth 认证"""
+        self.update_log("正在启动 OAuth 认证...")
+        try:
+            from iflow_oauth import start_oauth_flow, generate_auth_url, IFLOW_OAUTH_CONFIG
+            import asyncio
+            import secrets
+
+            state = secrets.token_urlsafe(16)
+            port = IFLOW_OAUTH_CONFIG["callback_port"]
+            auth_url, _ = generate_auth_url(state, port)
+
+            self.update_log(f"正在打开浏览器进行授权...")
+            webbrowser.open(auth_url)
+
+            def run_oauth():
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    credentials = loop.run_until_complete(start_oauth_flow())
+                    self.update_log(f"✓ OAuth 认证成功！API Key: {credentials['apiKey'][:20]}...")
+                except Exception as e:
+                    self.update_log(f"✗ OAuth 认证失败: {e}")
+
+            threading.Thread(target=run_oauth, daemon=True).start()
+        except Exception as e:
+            self.update_log(f"启动 OAuth 失败: {e}")
+
+    @pyqtSlot()
+    def check_health(self):
+        """检查服务健康状态"""
+        if not self.server_manager.is_running:
+            self.update_log("服务未运行，无法检查健康状态")
+            return
+
+        try:
+            import httpx
+            port = self.current_port
+
+            def check():
+                try:
+                    response = httpx.get(f"http://localhost:{port}/health", timeout=5.0)
+                    if response.status_code == 200:
+                        data = response.json()
+                        self.update_log(f"✓ 健康检查通过: {data.get('status', 'ok')}")
+                    else:
+                        self.update_log(f"✗ 健康检查失败: HTTP {response.status_code}")
+                except Exception as e:
+                    self.update_log(f"✗ 健康检查失败: {e}")
+
+            threading.Thread(target=check, daemon=True).start()
+        except Exception as e:
+            self.update_log(f"健康检查错误: {e}")
+
+    @pyqtSlot()
+    def show_system_info(self):
+        """显示系统信息对话框"""
+        uptime_seconds = int(time.time() - start_time)
+        hours = uptime_seconds // 3600
+        minutes = (uptime_seconds % 3600) // 60
+        uptime_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+
+        info = f"""Python版本: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}
+平台: {platform.system()} {platform.release()}
+CPU使用: {psutil.cpu_percent(interval=0.1):.1f}%
+内存使用: {psutil.virtual_memory().percent:.1f}%
+运行时间: {uptime_str}
+进程PID: {os.getpid()}"""
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("系统信息")
+        dialog.setFixedSize(300, 200)
+        dialog.setStyleSheet(Styles.get_style())
+        layout = QVBoxLayout(dialog)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setText(info)
+        text.setStyleSheet("QTextEdit { background: #1a0d05; color: #ff9966; border: 1px solid #ff5500; padding: 10px; }")
+        layout.addWidget(text)
+        dialog.exec_()
+
+    @pyqtSlot()
+    def show_api_examples(self):
+        """显示API使用示例对话框"""
+        port = self.current_port
+        examples = f"""# OpenAI 格式 - 对话补全
+curl http://localhost:{port}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -d '{{"model": "glm-4.7", "messages": [{{"role": "user", "content": "Hello"}}]}}'
+
+# Anthropic 格式 - 消息对话
+curl http://localhost:{port}/v1/messages \\
+  -H "Content-Type: application/json" \\
+  -H "x-api-key: YOUR_API_KEY" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -d '{{"model": "glm-4.7", "messages": [{{"role": "user", "content": "Hello"}}], "max_tokens": 1024}}'
+
+# 思考模式 - GLM-4.7
+curl http://localhost:{port}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -d '{{"model": "glm-4.7", "messages": [{{"role": "user", "content": "Solve: 2+2"}}], "reasoning_effort": "high"}}'"""
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("API 使用示例")
+        dialog.setFixedSize(600, 400)
+        dialog.setStyleSheet(Styles.get_style())
+        layout = QVBoxLayout(dialog)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setText(examples)
+        text.setStyleSheet("QTextEdit { background: #000000; color: #ff9966; border: 1px solid #ff5500; padding: 10px; font-family: 'Consolas', monospace; font-size: 9px; }")
+        layout.addWidget(text)
+        dialog.exec_()
 
     def closeEvent(self, event):
         """窗口关闭事件（优雅退出）"""

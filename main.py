@@ -1,6 +1,11 @@
 import uuid
 import logging
 import asyncio
+import os
+import time
+import platform
+import psutil
+import sys
 from datetime import datetime
 from contextlib import asynccontextmanager
 from collections import deque
@@ -8,6 +13,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from config import CONFIG
 from proxy import get_proxy
+
+start_time = time.time()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -79,6 +86,18 @@ async def admin_page():
         .section-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
         .chip-container { display: flex; flex-wrap: wrap; gap: 8px; }
         .chip { background: var(--bg-hover); padding: 6px 12px; border-radius: 9999px; font-size: 0.85rem; color: var(--text-main); border: 1px solid var(--border); }
+
+        /* System Info */
+        .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
+        .info-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: var(--bg-hover); border-radius: 8px; }
+        .info-label { color: var(--text-muted); font-size: 0.9rem; }
+        .info-value { color: var(--text-main); font-weight: 600; font-family: monospace; }
+
+        /* Usage Examples */
+        .usage-section { margin-top: 24px; }
+        .example-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .example-title { font-size: 1rem; font-weight: 600; margin-bottom: 8px; color: var(--primary); }
+        .example-code { background: #0b1120; padding: 12px; border-radius: 6px; overflow-x: auto; font-family: monospace; font-size: 0.85rem; color: #e2e8f0; border: 1px solid var(--border); }
         
         /* Logs Toolbar */
         .toolbar { display: flex; gap: 12px; margin-bottom: 16px; align-items: center; }
@@ -160,6 +179,58 @@ async def admin_page():
             <div class="section-title">📦 可用模型</div>
             <div class="card">
                 <div id="models" class="chip-container">加载中...</div>
+            </div>
+        </div>
+
+        <div class="models-container">
+            <div class="section-title">⚙️ 系统信息</div>
+            <div class="card">
+                <div class="info-grid" id="sysinfo">
+                    <div class="info-item"><span class="info-label">Python版本</span><span class="info-value" id="pyVersion">--</span></div>
+                    <div class="info-item"><span class="info-label">平台</span><span class="info-value" id="platform">--</span></div>
+                    <div class="info-item"><span class="info-label">CPU使用</span><span class="info-value" id="cpu">--</span></div>
+                    <div class="info-item"><span class="info-label">内存使用</span><span class="info-value" id="memory">--</span></div>
+                    <div class="info-item"><span class="info-label">运行时间</span><span class="info-value" id="uptime">--</span></div>
+                    <div class="info-item"><span class="info-label">进程PID</span><span class="info-value" id="pid">--</span></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="usage-section">
+            <div class="section-title">📖 API 使用示例</div>
+            <div class="example-card">
+                <div class="example-title">OpenAI 格式 - 对话补全</div>
+                <div class="example-code">curl http://localhost:8000/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -d '{
+    "model": "glm-4.7",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": false
+  }'</div>
+            </div>
+            <div class="example-card">
+                <div class="example-title">Anthropic 格式 - 消息对话</div>
+                <div class="example-code">curl http://localhost:8000/v1/messages \\
+  -H "Content-Type: application/json" \\
+  -H "x-api-key: YOUR_API_KEY" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -d '{
+    "model": "deepseek-v3",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'</div>
+            </div>
+            <div class="example-card">
+                <div class="example-title">思考模式 - GLM-4.7</div>
+                <div class="example-code">curl http://localhost:8000/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -d '{
+    "model": "glm-4.7",
+    "messages": [{"role": "user", "content": "解释量子纠缠"}],
+    "reasoning_effort": "high"
+  }'</div>
             </div>
         </div>
 
@@ -320,16 +391,14 @@ async def admin_page():
         async function loadModels() {
             const container = document.getElementById('models');
             try {
-                // container.innerHTML = '<span style="color:var(--text-muted)">加载中...</span>';
                 const res = await fetch('/v1/models?t=' + Date.now());
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const m = await res.json();
-                
+
                 if (m.data && Array.isArray(m.data) && m.data.length) {
                     container.innerHTML = m.data.map(x => `<span class="chip">${x.id}</span>`).join('');
                 } else {
                     container.innerHTML = '<span style="color:var(--text-muted)">无可用模型 (列表为空)</span>';
-                    console.log('Models data empty:', m);
                 }
             } catch (e) {
                 console.error("Load models failed:", e);
@@ -337,10 +406,26 @@ async def admin_page():
             }
         }
 
+        async function loadSystemInfo() {
+            try {
+                const info = await (await fetch('/admin/sysinfo')).json();
+                document.getElementById('pyVersion').textContent = info.python_version;
+                document.getElementById('platform').textContent = info.platform;
+                document.getElementById('cpu').textContent = info.cpu_percent + '%';
+                document.getElementById('memory').textContent = info.memory_percent + '%';
+                document.getElementById('uptime').textContent = info.uptime;
+                document.getElementById('pid').textContent = info.pid;
+            } catch (e) {
+                console.error("Load system info failed:", e);
+            }
+        }
+
         // Init
         refresh();
         loadModels();
+        loadSystemInfo();
         setInterval(refresh, 3000);
+        setInterval(loadSystemInfo, 5000);
     </script>
 </body>
 </html>"""
@@ -358,6 +443,27 @@ async def clear_logs():
     request_logs.clear()
     stats["total"] = stats["success"] = stats["error"] = 0
     return {"status": "ok"}
+
+@app.get("/admin/sysinfo")
+async def get_sysinfo():
+    uptime_seconds = int(time.time() - start_time)
+    hours = uptime_seconds // 3600
+    minutes = (uptime_seconds % 3600) // 60
+    uptime_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+
+    return {
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "platform": f"{platform.system()} {platform.release()}",
+        "cpu_percent": round(psutil.cpu_percent(interval=0.1), 1),
+        "memory_percent": round(psutil.virtual_memory().percent, 1),
+        "uptime": uptime_str,
+        "pid": os.getpid()
+    }
+
+@app.get("/health")
+@app.get("/v1/health")
+async def health_check():
+    return {"status": "ok", "service": "iflow2api"}
 
 @app.get("/v1/models")
 async def models(request: Request):
