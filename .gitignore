@@ -39,3 +39,6 @@ iflow2api-go/
 # Logs
 *.log
 server.log
+
+# Documentation
+CHANGES_SUMMARY.md

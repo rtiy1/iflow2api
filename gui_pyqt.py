@@ -485,11 +485,10 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(top_frame)
 
     def _init_button_container(self, parent_layout: QVBoxLayout):
-        """初始化按钮容器（参照Claude Code样式，采用流式布局感）"""
-        btn_layout = QHBoxLayout() 
+        """初始化按钮容器（两列布局）"""
+        btn_layout = QGridLayout()
         btn_layout.setSpacing(8)
         btn_layout.setContentsMargins(5, 5, 5, 5)
-        btn_layout.setAlignment(Qt.AlignLeft) # 左对齐，不拉伸
 
         btn_container = QFrame()
         btn_container.setLayout(btn_layout)
@@ -529,15 +528,15 @@ class MainWindow(QMainWindow):
         self.btn_github.clicked.connect(lambda: webbrowser.open("https://github.com/rtiy1/ifow2api"))
         self.btn_github.setProperty("class", "ActionBtn")
 
-        # 将按钮添加到布局
-        btn_layout.addWidget(self.btn_start)
-        btn_layout.addWidget(self.btn_admin)
-        btn_layout.addWidget(self.btn_clear)
-        btn_layout.addWidget(self.btn_oauth)
-        btn_layout.addWidget(self.btn_health)
-        btn_layout.addWidget(self.btn_sysinfo)
-        btn_layout.addWidget(self.btn_api)
-        btn_layout.addWidget(self.btn_github)
+        # 两列布局：4行×2列
+        btn_layout.addWidget(self.btn_start, 0, 0)
+        btn_layout.addWidget(self.btn_admin, 0, 1)
+        btn_layout.addWidget(self.btn_clear, 1, 0)
+        btn_layout.addWidget(self.btn_oauth, 1, 1)
+        btn_layout.addWidget(self.btn_health, 2, 0)
+        btn_layout.addWidget(self.btn_sysinfo, 2, 1)
+        btn_layout.addWidget(self.btn_api, 3, 0)
+        btn_layout.addWidget(self.btn_github, 3, 1)
 
         parent_layout.addWidget(btn_container)
 
