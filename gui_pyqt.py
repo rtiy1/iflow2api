@@ -256,10 +256,14 @@ class ServerWorker(QThread):
         try:
             config = uvicorn.Config(app, host="0.0.0.0", port=self.port, log_config=None)
             self.server = uvicorn.Server(config)
+
+            # 标记服务器已启动（在实际运行前）
             self.server_started.emit()
+
+            # 运行服务器（会阻塞直到服务器停止）
             asyncio.run(self.server.serve())
         except Exception as e:
-            self.server_error.emit(f"Server Error: {str(e)}")
+            self.server_error.emit(f"启动失败: {str(e)}")
         finally:
             self._is_running = False
             self.server_stopped.emit()
@@ -528,15 +532,15 @@ class MainWindow(QMainWindow):
         self.btn_github.clicked.connect(lambda: webbrowser.open("https://github.com/rtiy1/ifow2api"))
         self.btn_github.setProperty("class", "ActionBtn")
 
-        # 两列布局：4行×2列
+        # 两行布局：2行×4列
         btn_layout.addWidget(self.btn_start, 0, 0)
         btn_layout.addWidget(self.btn_admin, 0, 1)
-        btn_layout.addWidget(self.btn_clear, 1, 0)
-        btn_layout.addWidget(self.btn_oauth, 1, 1)
-        btn_layout.addWidget(self.btn_health, 2, 0)
-        btn_layout.addWidget(self.btn_sysinfo, 2, 1)
-        btn_layout.addWidget(self.btn_api, 3, 0)
-        btn_layout.addWidget(self.btn_github, 3, 1)
+        btn_layout.addWidget(self.btn_clear, 0, 2)
+        btn_layout.addWidget(self.btn_oauth, 0, 3)
+        btn_layout.addWidget(self.btn_health, 1, 0)
+        btn_layout.addWidget(self.btn_sysinfo, 1, 1)
+        btn_layout.addWidget(self.btn_api, 1, 2)
+        btn_layout.addWidget(self.btn_github, 1, 3)
 
         parent_layout.addWidget(btn_container)
 
