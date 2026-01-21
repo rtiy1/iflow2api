@@ -327,11 +327,14 @@ class ServerManager:
 # 主窗口（核心优化）
 # ==============================
 class MainWindow(QMainWindow):
+    log_signal = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.server_manager = ServerManager()
         self.last_log = ""  # 缓存最后一条日志，避免重复更新
         self.current_port = DEFAULT_PORT
+        self.log_signal.connect(self.update_log)
         self.init_ui()
         self.init_timer()
         self.connect_server_signals()
@@ -699,37 +702,34 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def start_oauth(self):
         """启动 OAuth 认证"""
-        self.update_log("正在启动 OAuth 认证...")
+        self.log_signal.emit("正在启动 OAuth 认证...")
         try:
-            from iflow_oauth import start_oauth_flow, generate_auth_url, IFLOW_OAUTH_CONFIG
+            from iflow_oauth import start_oauth_flow
             import asyncio
-            import secrets
-
-            state = secrets.token_urlsafe(16)
-            port = IFLOW_OAUTH_CONFIG["callback_port"]
-            auth_url, _ = generate_auth_url(state, port)
-
-            self.update_log(f"正在打开浏览器进行授权...")
-            webbrowser.open(auth_url)
 
             def run_oauth():
                 try:
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
-                    credentials = loop.run_until_complete(start_oauth_flow())
-                    self.update_log(f"✓ OAuth 认证成功！API Key: {credentials['apiKey'][:20]}...")
+
+                    def open_browser(url):
+                        self.log_signal.emit("正在打开浏览器进行授权...")
+                        webbrowser.open(url)
+
+                    credentials = loop.run_until_complete(start_oauth_flow(on_auth_url=open_browser))
+                    self.log_signal.emit(f"✓ OAuth 认证成功！API Key: {credentials['apiKey'][:20]}...")
                 except Exception as e:
-                    self.update_log(f"✗ OAuth 认证失败: {e}")
+                    self.log_signal.emit(f"✗ OAuth 认证失败: {e}")
 
             threading.Thread(target=run_oauth, daemon=True).start()
         except Exception as e:
-            self.update_log(f"启动 OAuth 失败: {e}")
+            self.log_signal.emit(f"启动 OAuth 失败: {e}")
 
     @pyqtSlot()
     def check_health(self):
         """检查服务健康状态"""
         if not self.server_manager.is_running:
-            self.update_log("服务未运行，无法检查健康状态")
+            self.log_signal.emit("服务未运行，无法检查健康状态")
             return
 
         try:
@@ -741,15 +741,15 @@ class MainWindow(QMainWindow):
                     response = httpx.get(f"http://localhost:{port}/health", timeout=5.0)
                     if response.status_code == 200:
                         data = response.json()
-                        self.update_log(f"✓ 健康检查通过: {data.get('status', 'ok')}")
+                        self.log_signal.emit(f"✓ 健康检查通过: {data.get('status', 'ok')}")
                     else:
-                        self.update_log(f"✗ 健康检查失败: HTTP {response.status_code}")
+                        self.log_signal.emit(f"✗ 健康检查失败: HTTP {response.status_code}")
                 except Exception as e:
-                    self.update_log(f"✗ 健康检查失败: {e}")
+                    self.log_signal.emit(f"✗ 健康检查失败: {e}")
 
             threading.Thread(target=check, daemon=True).start()
         except Exception as e:
-            self.update_log(f"健康检查错误: {e}")
+            self.log_signal.emit(f"健康检查错误: {e}")
 
     @pyqtSlot()
     def show_system_info(self):

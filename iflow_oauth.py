@@ -139,14 +139,22 @@ async def fetch_user_info(access_token: str) -> Dict[str, Any]:
         }
 
 
-async def start_oauth_flow(save_path: Optional[str] = None) -> Dict[str, Any]:
-    """启动 OAuth 流程"""
+async def start_oauth_flow(save_path: Optional[str] = None, on_auth_url=None) -> Dict[str, Any]:
+    """启动 OAuth 流程
+
+    Args:
+        save_path: 凭据保存路径
+        on_auth_url: 可选的回调函数，接收 auth_url 参数，用于自定义处理（如自动打开浏览器）
+    """
     state = secrets.token_urlsafe(16)
     port = IFLOW_OAUTH_CONFIG["callback_port"]
 
     auth_url, redirect_uri = generate_auth_url(state, port)
 
-    print(f"\n请在浏览器中打开以下链接进行授权：\n{auth_url}\n")
+    if on_auth_url:
+        on_auth_url(auth_url)
+    else:
+        print(f"\n请在浏览器中打开以下链接进行授权：\n{auth_url}\n")
 
     # 启动回调服务器
     server = HTTPServer(("0.0.0.0", port), OAuthCallbackHandler)

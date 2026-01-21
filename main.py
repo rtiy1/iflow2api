@@ -24,8 +24,7 @@ request_logs = deque(maxlen=100)
 stats = {"total": 0, "success": 0, "error": 0}
 from converters import (
     anthropic_to_openai,
-    openai_to_anthropic,
-    make_anthropic_stream_events,
+    openai_to_anthropic_nonstream,
     StreamConverter,
 )
 
@@ -495,7 +494,7 @@ async def chat_completions(request: Request):
             content_parts = []
 
             async def stream():
-                async for chunk in await proxy.chat_completions(body, stream=True):
+                async for chunk in await proxy.proxy_request("/chat/completions", body, model, stream=True):
                     line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
                     if line and line.startswith("data: ") and not line.endswith("[DONE]"):
                         try:
@@ -520,7 +519,7 @@ async def chat_completions(request: Request):
 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
-        data = await proxy.chat_completions(body, stream=False)
+        data = await proxy.proxy_request("/chat/completions", body, model, stream=False)
         logger.info(f"Non-stream response usage: {data.get('usage')}")
         reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -589,10 +588,8 @@ async def anthropic_messages(request: Request):
             content_parts = []
 
             async def stream():
-                for event in make_anthropic_stream_events(model, msg_id):
-                    yield event
-                converter = StreamConverter()
-                async for chunk in await proxy.chat_completions(openai_req, stream=True):
+                converter = StreamConverter(model, msg_id)
+                async for chunk in await proxy.proxy_request("/chat/completions", openai_req, model, stream=True):
                     line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
                     if line and line.startswith("data: ") and not line.endswith("[DONE]"):
                         try:
@@ -608,8 +605,6 @@ async def anthropic_messages(request: Request):
                     if line:
                         for event in converter.convert_chunk(line):
                             yield event
-                for event in converter.finish():
-                    yield event
                 request_logs.appendleft({
                     "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/messages",
                     "status": 200, "model": model, "reasoning": "".join(reasoning_parts)[:3000], "content": "".join(content_parts)[:1000]
@@ -619,7 +614,7 @@ async def anthropic_messages(request: Request):
 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
-        data = await proxy.chat_completions(openai_req, stream=False)
+        data = await proxy.proxy_request("/chat/completions", openai_req, model, stream=False)
         logger.info(f"Non-stream response usage: {data.get('usage')}")
         reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -629,7 +624,7 @@ async def anthropic_messages(request: Request):
         })
         stats["total"] += 1
         stats["success"] += 1
-        return JSONResponse(openai_to_anthropic(data))
+        return JSONResponse(openai_to_anthropic_nonstream(data))
     except Exception as e:
         stats["total"] += 1
         stats["error"] += 1
