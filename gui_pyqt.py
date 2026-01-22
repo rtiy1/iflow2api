@@ -541,7 +541,7 @@ class MainWindow(QMainWindow):
         self.btn_api.setProperty("class", "ActionBtn")
 
         self.btn_github = QPushButton("GitHub")
-        self.btn_github.clicked.connect(lambda: webbrowser.open("https://github.com/rtiy1/ifow2api"))
+        self.btn_github.clicked.connect(lambda: webbrowser.open("https://github.com/rtiy1/iflow2api"))
         self.btn_github.setProperty("class", "ActionBtn")
 
         # 两行布局：2行×4列
