@@ -8,7 +8,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import httpx
 import base64
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 
 # iFlow OAuth 配置
@@ -62,7 +62,7 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-def generate_auth_url(state: str, port: int) -> tuple[str, str]:
+def generate_auth_url(state: str, port: int) -> Tuple[str, str]:
     """生成授权 URL"""
     redirect_uri = f"http://localhost:{port}/oauth2callback"
     params = {

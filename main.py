@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # 请求日志存储
 request_logs = deque(maxlen=100)
 stats = {"total": 0, "success": 0, "error": 0}
+from context_compressor import compress_context
 from converters import (
     anthropic_to_openai,
     openai_to_anthropic_nonstream,
@@ -482,6 +483,18 @@ async def chat_completions(request: Request):
 
     model = body.get("model", "unknown")
     body["max_tokens"] = max(body.get("max_tokens", 4096), 1024)
+
+    # 验证消息数组
+    messages = body.get("messages", [])
+    if not messages or not isinstance(messages, list):
+        return make_openai_error(400, "messages array is required and must be non-empty", "invalid_request_error")
+
+    # 上下文压缩
+    system_msg = next((m.get("content") for m in messages if m.get("role") == "system"), None)
+    compressed_messages, compress_stats = compress_context(messages, system_msg)
+    if compress_stats["removed_count"] > 0:
+        body["messages"] = compressed_messages
+
     logger.info(f"Request model={model}, thinking={body.get('thinking')}, has_tools={bool(body.get('tools'))}")
 
     try:
@@ -494,21 +507,56 @@ async def chat_completions(request: Request):
             content_parts = []
 
             async def stream():
-                async for chunk in await proxy.proxy_request("/chat/completions", body, model, stream=True):
-                    line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
-                    if line and line.startswith("data: ") and not line.endswith("[DONE]"):
-                        try:
-                            data = _json.loads(line[6:])
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            if delta.get("reasoning_content"):
-                                reasoning_parts.append(delta["reasoning_content"])
-                                logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
-                            if delta.get("content"):
-                                content_parts.append(delta["content"])
-                        except Exception as e:
-                            logger.warning(f"Parse chunk error: {e}")
-                    if line:
-                        yield line if line.endswith("\n\n") else line + "\n\n"
+                MAX_CONTINUATIONS = 5
+                continuation_count = 0
+                current_body = body.copy()
+                accumulated_content = ""
+                accumulated_reasoning = ""
+
+                while continuation_count <= MAX_CONTINUATIONS:
+                    last_finish_reason = None
+
+                    async for chunk in await proxy.proxy_request("/chat/completions", current_body, model, stream=True):
+                        line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                        if line and line.startswith("data: ") and not line.endswith("[DONE]"):
+                            try:
+                                data = _json.loads(line[6:])
+                                choice = data.get("choices", [{}])[0]
+                                delta = choice.get("delta", {})
+                                last_finish_reason = choice.get("finish_reason")
+
+                                if delta.get("reasoning_content"):
+                                    reasoning_parts.append(delta["reasoning_content"])
+                                    accumulated_reasoning += delta["reasoning_content"]
+                                    logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
+                                if delta.get("content"):
+                                    content_parts.append(delta["content"])
+                                    accumulated_content += delta["content"]
+                            except Exception as e:
+                                logger.warning(f"Parse chunk error: {e}")
+
+                        # 不发送 [DONE]，由续写逻辑控制
+                        if line and "[DONE]" not in line:
+                            yield line if line.endswith("\n\n") else line + "\n\n"
+
+                    # 检查是否需要续写
+                    if last_finish_reason != "length":
+                        break
+
+                    continuation_count += 1
+                    if continuation_count > MAX_CONTINUATIONS:
+                        break
+
+                    logger.info(f"流式输出被截断，自动续写 ({continuation_count}/{MAX_CONTINUATIONS})")
+
+                    # 追加已生成的内容，继续请求
+                    assistant_msg = {"role": "assistant", "content": accumulated_content}
+                    if accumulated_reasoning:
+                        assistant_msg["reasoning_content"] = accumulated_reasoning
+                    current_body["messages"] = current_body.get("messages", []) + [assistant_msg]
+
+                # 发送最终的 [DONE]
+                yield "data: [DONE]\n\n"
 
                 request_logs.appendleft({
                     "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/chat/completions",
@@ -521,6 +569,52 @@ async def chat_completions(request: Request):
 
         data = await proxy.proxy_request("/chat/completions", body, model, stream=False)
         logger.info(f"Non-stream response usage: {data.get('usage')}")
+
+        # 自动续写：当因 max_tokens 截断时，继续请求
+        MAX_CONTINUATIONS = 5
+        continuation_count = 0
+        while continuation_count < MAX_CONTINUATIONS:
+            choice = data.get("choices", [{}])[0]
+            finish_reason = choice.get("finish_reason")
+            if finish_reason != "length":
+                break
+
+            continuation_count += 1
+            logger.info(f"输出被截断，自动续写 ({continuation_count}/{MAX_CONTINUATIONS})")
+
+            # 将当前回复追加到消息中，继续请求
+            assistant_msg = choice.get("message", {})
+            body["messages"] = body.get("messages", []) + [assistant_msg]
+
+            next_data = await proxy.proxy_request("/chat/completions", body, model, stream=False)
+
+            # 合并内容
+            next_choice = next_data.get("choices", [{}])[0]
+            next_msg = next_choice.get("message", {})
+
+            # 合并 content
+            if next_msg.get("content"):
+                current_content = assistant_msg.get("content", "") or ""
+                assistant_msg["content"] = current_content + next_msg["content"]
+
+            # 合并 reasoning_content
+            if next_msg.get("reasoning_content"):
+                current_reasoning = assistant_msg.get("reasoning_content", "") or ""
+                assistant_msg["reasoning_content"] = current_reasoning + next_msg["reasoning_content"]
+
+            # 更新 finish_reason 和 usage
+            choice["finish_reason"] = next_choice.get("finish_reason")
+            choice["message"] = assistant_msg
+            if next_data.get("usage"):
+                prev_usage = data.get("usage", {})
+                next_usage = next_data.get("usage", {})
+                data["usage"] = {
+                    "prompt_tokens": next_usage.get("prompt_tokens", 0),
+                    "completion_tokens": prev_usage.get("completion_tokens", 0) + next_usage.get("completion_tokens", 0),
+                    "total_tokens": next_usage.get("prompt_tokens", 0) + prev_usage.get("completion_tokens", 0) + next_usage.get("completion_tokens", 0)
+                }
+            data["choices"][0] = choice
+
         reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         request_logs.appendleft({
@@ -530,9 +624,16 @@ async def chat_completions(request: Request):
         stats["total"] += 1
         stats["success"] += 1
         return data
+    except httpx.HTTPStatusError as e:
+        stats["total"] += 1
+        stats["error"] += 1
+        status_code = e.response.status_code
+        logger.error(f"上游 API 返回错误 HTTP {status_code} for model={model}: {e}")
+        return make_openai_error(502, f"Upstream API error: HTTP {status_code}", "upstream_error")
     except Exception as e:
         stats["total"] += 1
         stats["error"] += 1
+        logger.error(f"请求处理失败 for model={model}: {type(e).__name__}: {e}")
         return make_openai_error(500, str(e), "internal_error")
 
 @app.post("/v1/messages/count_tokens")
@@ -576,6 +677,14 @@ async def anthropic_messages(request: Request):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     model = body.get("model", "")
     openai_req["max_tokens"] = max(openai_req.get("max_tokens", 4096), 1024)
+
+    # 上下文压缩
+    messages = openai_req.get("messages", [])
+    system_msg = body.get("system")  # Anthropic 格式的 system 在顶层
+    compressed_messages, compress_stats = compress_context(messages, system_msg)
+    if compress_stats["removed_count"] > 0:
+        openai_req["messages"] = compressed_messages
+
     logger.info(f"Request model={model}, thinking={openai_req.get('thinking')}, has_tools={bool(openai_req.get('tools'))}")
 
     try:

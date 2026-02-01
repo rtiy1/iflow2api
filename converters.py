@@ -554,6 +554,9 @@ class StreamConverter:
         # usage
         if self.finish_reason and "usage" in data:
             usage = data["usage"]
+            # 处理 usage 可能不是字典的情况
+            if not isinstance(usage, dict):
+                usage = {}
             self.input_tokens = usage.get("prompt_tokens", 0)
             self.output_tokens = usage.get("completion_tokens", 0)
             self.cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)

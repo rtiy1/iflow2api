@@ -20,6 +20,9 @@ nuitka-crash-report.xml
 # Claude Code
 .claude/
 
+# Gemini CLI
+.gemini/
+
 # Windows
 nul
 

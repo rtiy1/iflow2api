@@ -4,7 +4,12 @@ import gzip
 import json
 import io
 import logging
+import asyncio
 from typing import AsyncIterator, Optional, Dict, Any, List
+
+# 重试配置
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0  # 秒
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from config import CONFIG
 from iflow_token import IFlowTokenStorage, load_token_from_file, save_token_to_file, refresh_oauth_tokens
@@ -197,27 +202,44 @@ class ReverseProxy:
             return await self._proxy_non_stream(client, endpoint, headers, processed_body)
 
     async def _proxy_non_stream(self, client: httpx.AsyncClient, endpoint: str, headers: Dict[str, str], body: Dict[str, Any]):
-        """非流式代理"""
-        try:
-            response = await client.post(
-                f"{self.upstream_url}{endpoint}",
-                headers=headers,
-                json=body,
-            )
-            response.raise_for_status()
+        """非流式代理 - 带重试"""
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await client.post(
+                    f"{self.upstream_url}{endpoint}",
+                    headers=headers,
+                    json=body,
+                )
+                response.raise_for_status()
 
-            # 修改响应
-            response_headers = dict(response.headers)
-            content = self._modify_response(response.content, response.status_code, response_headers)
-            result = json.loads(content)
+                # 修改响应
+                response_headers = dict(response.headers)
+                content = self._modify_response(response.content, response.status_code, response_headers)
+                result = json.loads(content)
 
-            if "usage" not in result:
-                result["usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                if "usage" not in result:
+                    result["usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-            return result
-        except Exception as e:
-            logger.error(f"amp upstream proxy error for POST {endpoint}: {e}")
-            raise
+                return result
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                status_code = e.response.status_code
+                logger.warning(f"上游 API 错误 (尝试 {attempt + 1}/{MAX_RETRIES}): HTTP {status_code} - {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+            except Exception as e:
+                last_error = e
+                logger.warning(f"请求失败 (尝试 {attempt + 1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+
+        # 区分错误类型记录
+        if isinstance(last_error, httpx.HTTPStatusError):
+            logger.error(f"上游 API 持续返回错误 HTTP {last_error.response.status_code} for POST {endpoint}: {last_error}")
+        else:
+            logger.error(f"代理请求失败 for POST {endpoint}: {last_error}")
+        raise last_error
 
     async def _proxy_stream(self, client: httpx.AsyncClient, endpoint: str, headers: Dict[str, str], body: Dict[str, Any]) -> AsyncIterator[bytes]:
         """流式代理 - 按 SSE 事件边界读取
