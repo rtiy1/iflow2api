@@ -489,16 +489,15 @@ async def chat_completions(request: Request):
     if not messages or not isinstance(messages, list):
         return make_openai_error(400, "messages array is required and must be non-empty", "invalid_request_error")
 
-    # 上下文压缩
-    system_msg = next((m.get("content") for m in messages if m.get("role") == "system"), None)
-    compressed_messages, compress_stats = compress_context(messages, system_msg)
-    if compress_stats["removed_count"] > 0:
-        body["messages"] = compressed_messages
-
     logger.info(f"Request model={model}, thinking={body.get('thinking')}, has_tools={bool(body.get('tools'))}")
 
     try:
         proxy = get_proxy()
+
+        # 上下文压缩
+        compressed_messages, compress_stats = await compress_context(messages, proxy)
+        if compress_stats["removed_count"] > 0:
+            body["messages"] = compressed_messages
 
         if body.get("stream"):
             body["stream_options"] = {"include_usage": True}
@@ -678,17 +677,16 @@ async def anthropic_messages(request: Request):
     model = body.get("model", "")
     openai_req["max_tokens"] = max(openai_req.get("max_tokens", 4096), 1024)
 
-    # 上下文压缩
-    messages = openai_req.get("messages", [])
-    system_msg = body.get("system")  # Anthropic 格式的 system 在顶层
-    compressed_messages, compress_stats = compress_context(messages, system_msg)
-    if compress_stats["removed_count"] > 0:
-        openai_req["messages"] = compressed_messages
-
     logger.info(f"Request model={model}, thinking={openai_req.get('thinking')}, has_tools={bool(openai_req.get('tools'))}")
 
     try:
         proxy = get_proxy()
+
+        # 上下文压缩
+        messages = openai_req.get("messages", [])
+        compressed_messages, compress_stats = await compress_context(messages, proxy)
+        if compress_stats["removed_count"] > 0:
+            openai_req["messages"] = compressed_messages
 
         if body.get("stream"):
             openai_req["stream_options"] = {"include_usage": True}

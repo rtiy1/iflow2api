@@ -20,10 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def remove_query_values_matching(url: str, key: str, match: str) -> str:
-    """从 URL 查询参数中移除匹配的值
 
-    参考 Go: removeQueryValuesMatching(req *http.Request, key string, match string)
-    """
     if not url or not match:
         return url
 
@@ -47,10 +44,7 @@ def remove_query_values_matching(url: str, key: str, match: str) -> str:
 
 
 def filter_beta_features(header: str, feature_to_remove: str) -> str:
-    """从逗号分隔的列表中过滤特定的 beta 功能
 
-    参考 Go: filterBetaFeatures(header, featureToRemove string) string
-    """
     features = header.split(",")
     filtered = []
 
@@ -72,8 +66,30 @@ def is_streaming_response(content_type: str) -> bool:
     return "text/event-stream" in content_type
 
 
+def get_default_system_prompt() -> str:
+    """生成默认系统提示词"""
+    return """--- SYSTEM PROMPT BEGIN ---
+## Tool Usage Strategy
+- 严禁猜测代码位置。必须使用工具获取确切的符号关系和定义。
+- 优先使用工具解决问题，避免盲目猜测和假设。
+- 在进行代码阅读和修改前，务必先通过工具确认符号关系和定义，避免误操作。
+- 在进行代码修改时，务必先通过工具分析影响范围，避免破坏现有功能。
+## Tool Call Format (MANDATORY)
+- 工具调用必须严格遵守规范格式，所有必需参数必须提供，禁止省略。
+- 禁止发送空参数或缺少参数的工具调用，这会导致系统错误。
+- 调用工具前必须确认所有 required 参数都已正确填写。
+- 工具调用错误通常是路径或操作系统问题，请检查路径格式参数等是否正确。
+- 如果在 plan 模式下工具调用失败可能导致循环调用，遇到错误时应停止重试并分析原因。
+## Code Modification Rules
+- 修改代码前必须分析可能的副作用，包括对其他模块、函数、测试的影响。
+- 修改公共接口或共享代码时，必须检查所有调用方。
+## File Reading Rules (CRITICAL)
+- 禁止一次性读取超大文件（>10kb），必须使用 offset 和 limit 参数分段读取。
+- 读取大文件前先评估文件大小，优先使用 Grep 搜索定位关键内容。
+--- SYSTEM PROMPT END ---"""
+
+
 class ReverseProxy:
-    """反向代理实现 - 完全参考 CLIProxyAPI/internal/api/modules/amp/proxy.go"""
 
     def __init__(self, upstream_url: str, api_key: str, token_file_path: Optional[str] = None):
         self.upstream_url = upstream_url.rstrip("/")
@@ -146,14 +162,35 @@ class ReverseProxy:
         processed = body.copy()
         processed["model"] = model
         processed = apply_thinking(processed, model)
+
+        # 注入默认系统提示词
+        default_prompt = get_default_system_prompt()
+        messages = processed.get("messages", [])
+
+        # 查找是否已有 system 消息
+        system_msg_idx = None
+        for idx, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                system_msg_idx = idx
+                break
+
+        if system_msg_idx is not None:
+            # 追加到现有 system 消息
+            existing_content = messages[system_msg_idx].get("content", "")
+            if isinstance(existing_content, str):
+                messages[system_msg_idx]["content"] = f"{default_prompt}\n\n{existing_content}"
+            elif isinstance(existing_content, list):
+                # 如果是列表格式,在开头插入文本块
+                messages[system_msg_idx]["content"] = [{"type": "text", "text": default_prompt}] + existing_content
+        else:
+            # 在开头插入新的 system 消息
+            messages.insert(0, {"role": "system", "content": default_prompt})
+
+        processed["messages"] = messages
         return processed
 
     def _modify_response(self, content: bytes, status_code: int, headers: Dict[str, str]) -> bytes:
-        """修改响应（ModifyResponse）
-
-        参考 Go: proxy.ModifyResponse = func(resp *http.Response) error
-        处理没有 Content-Encoding 的 gzip 响应
-        """
+  
         # 只处理成功响应
         if status_code < 200 or status_code >= 300:
             return content

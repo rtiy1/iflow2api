@@ -1,4 +1,3 @@
-"""OpenAI <-> Anthropic 格式转换器 - 完全参考 CLIProxyAPI 实现"""
 
 import json
 import uuid
@@ -417,7 +416,6 @@ def _map_finish_reason(reason: str) -> str:
 
 
 class StreamConverter:
-    """流式转换器 - 完全参考 Go 实现"""
 
     def __init__(self, model: str, message_id: str):
         self.model = model
