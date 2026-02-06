@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QSystemTrayIcon, QMenu, QAction
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, QSize, pyqtSignal, pyqtSlot, QThread, QPoint, QSettings, QEvent
+    Qt, QTimer, QSize, pyqtSignal, pyqtSlot, QThread, QPoint, QSettings
 )
 from PyQt5.QtGui import QFont, QColor, QPainter, QIntValidator, QCursor, QIcon
 import sys
@@ -38,7 +38,6 @@ LOGO_TEXT = "IFLOW\nTO API"
 VERSION_TEXT = "永久版"
 APP_ID = "iFlow2API"
 SETTINGS_AUTOSTART = "autostart_enabled"
-SETTINGS_MINIMIZE_TRAY = "minimize_to_tray"
 STARTUP_BAT_NAME = "iFlow2API_Autostart.bat"
 
 
@@ -372,7 +371,6 @@ class MainWindow(QMainWindow):
         self.current_port = DEFAULT_PORT
         self.settings = QSettings(APP_ID, "Console")
         self.tray_icon = None
-        self.minimize_to_tray = False
         self._allow_close = False
         self.log_signal.connect(self.update_log)
         self.init_ui()
@@ -468,17 +466,8 @@ class MainWindow(QMainWindow):
         self.m_drag = False
         self.setCursor(QCursor(Qt.ArrowCursor))
 
-    def changeEvent(self, event):
-        if event.type() == QEvent.WindowStateChange:
-            if self.minimize_to_tray and self.isMinimized():
-                QTimer.singleShot(0, self._hide_to_tray)
-        super().changeEvent(event)
-
     def on_minimize_clicked(self):
-        if self.minimize_to_tray and self.tray_icon:
-            self._hide_to_tray(show_notice=False)
-        else:
-            self.showMinimized()
+        self.showMinimized()
 
     def closeEvent(self, event):
         if self._allow_close:
@@ -486,7 +475,7 @@ class MainWindow(QMainWindow):
             self.timer.stop()
             event.accept()
             return
-        if self.minimize_to_tray and self.tray_icon:
+        if self.tray_icon:
             self._hide_to_tray(show_notice=True)
             event.ignore()
             return
@@ -643,11 +632,8 @@ class MainWindow(QMainWindow):
 
         self.chk_autostart = QCheckBox("开机自启")
         self.chk_autostart.toggled.connect(self.on_autostart_toggled)
-        self.chk_tray = QCheckBox("最小化到托盘")
-        self.chk_tray.toggled.connect(self.on_tray_toggled)
 
         settings_layout.addWidget(self.chk_autostart)
-        settings_layout.addWidget(self.chk_tray)
         settings_layout.addStretch()
         btn_layout.addWidget(settings_row, 2, 0, 1, 4)
 
@@ -707,26 +693,15 @@ class MainWindow(QMainWindow):
         menu.addAction(action_quit)
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(self.on_tray_activated)
-        self.tray_icon.setVisible(False)
+        self.tray_icon.setVisible(True)
 
     def load_settings(self):
         """加载本地设置"""
         autostart = self.settings.value(SETTINGS_AUTOSTART, False, type=bool)
-        minimize = self.settings.value(SETTINGS_MINIMIZE_TRAY, True, type=bool)
 
         self.chk_autostart.blockSignals(True)
         self.chk_autostart.setChecked(autostart)
         self.chk_autostart.blockSignals(False)
-
-        if not self.tray_icon:
-            minimize = False
-        self.chk_tray.blockSignals(True)
-        self.chk_tray.setChecked(minimize)
-        self.chk_tray.blockSignals(False)
-
-        self.minimize_to_tray = minimize
-        if self.tray_icon:
-            self.tray_icon.setVisible(minimize)
 
         if autostart:
             ok, msg = self._set_autostart_enabled(True)
@@ -744,18 +719,6 @@ class MainWindow(QMainWindow):
             return
         self.settings.setValue(SETTINGS_AUTOSTART, checked)
         self.update_log("开机自启已开启" if checked else "开机自启已关闭")
-
-    def on_tray_toggled(self, checked: bool):
-        if not self.tray_icon:
-            self.update_log("当前系统不支持托盘")
-            self.chk_tray.blockSignals(True)
-            self.chk_tray.setChecked(False)
-            self.chk_tray.blockSignals(False)
-            return
-        self.minimize_to_tray = checked
-        self.settings.setValue(SETTINGS_MINIMIZE_TRAY, checked)
-        self.tray_icon.setVisible(checked)
-        self.update_log("已启用最小化到托盘" if checked else "已关闭最小化到托盘")
 
     def _get_startup_dir(self) -> str:
         appdata = os.environ.get("APPDATA", "")

@@ -28,6 +28,11 @@ KNOWN_MULTIMODAL_MODELS = {
     "qwen3-vl-plus",
     "tstars2.0",
 }
+EXTRA_MODELS = [
+    "glm-4.7",
+    "minimax-m2.1",
+    "kimi-k2.5",
+]
 
 
 def remove_query_values_matching(url: str, key: str, match: str) -> str:
@@ -264,6 +269,41 @@ def _is_vision_model(model: str) -> bool:
 
 def _forced_model_is_multimodal() -> bool:
     return _is_vision_model(FORCED_VISION_MODEL)
+
+
+def _append_extra_models(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, list):
+        payload = {"object": "list", "data": payload}
+    elif not isinstance(payload, dict):
+        payload = {"object": "list", "data": []}
+
+    models = payload.get("data")
+    if not isinstance(models, list):
+        models = []
+        payload["data"] = models
+
+    existing_ids = set()
+    for item in models:
+        if isinstance(item, dict):
+            model_id = item.get("id")
+            if isinstance(model_id, str) and model_id:
+                existing_ids.add(model_id)
+
+    for model_id in EXTRA_MODELS:
+        if model_id in existing_ids:
+            continue
+        models.append(
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "iflow-extra",
+            }
+        )
+
+    if not payload.get("object"):
+        payload["object"] = "list"
+    return payload
 
 
 def get_default_system_prompt() -> str:
@@ -538,7 +578,7 @@ class ReverseProxy:
 
             response_headers = dict(response.headers)
             content = self._modify_response(response.content, response.status_code, response_headers)
-            return json.loads(content)
+            return _append_extra_models(json.loads(content))
         except Exception as e:
             logger.error(f"amp upstream proxy error for GET /models: {e}")
             raise

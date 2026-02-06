@@ -34,15 +34,22 @@ jobs:
           PYTHONUTF8: "1"
         run: |
           python build_gui.py
+          python build_agent.py
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: iflow2api-gui-exe
-          path: dist/iflow2api-gui.exe
+          name: iflow2api-windows-exe
+          path: |
+            dist/iflow2api-gui.exe
+            dist/iflow2api-agent.exe
+            stop_iflow2api.bat
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/iflow2api-gui.exe
+          files: |
+            dist/iflow2api-gui.exe
+            dist/iflow2api-agent.exe
+            stop_iflow2api.bat
