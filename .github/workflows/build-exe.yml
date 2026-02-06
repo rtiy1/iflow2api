@@ -3,7 +3,7 @@ name: Build Windows EXE
 on:
   push:
     branches:
-      - "**"
+      - main
   workflow_dispatch:
 
 jobs:
@@ -25,6 +25,8 @@ jobs:
           key: venv-gui-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
       - name: Build EXE
+        env:
+          PYTHONUTF8: "1"
         run: |
           python build_gui.py
 
