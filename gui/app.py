@@ -19,6 +19,7 @@ import platform
 import psutil
 import os
 import time
+from pathlib import Path
 from datetime import datetime
 from app.server import app, request_logs, stats, CONFIG
 
@@ -39,6 +40,18 @@ APP_ID = "iFlow2API"
 SETTINGS_AUTOSTART = "autostart_enabled"
 SETTINGS_MINIMIZE_TRAY = "minimize_to_tray"
 STARTUP_BAT_NAME = "iFlow2API_Autostart.bat"
+
+
+def resource_path(*parts: str) -> str:
+    """Resolve resource paths for dev and PyInstaller."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base_dir = Path(sys._MEIPASS)
+    else:
+        base_dir = Path(__file__).resolve().parent.parent
+    return str(base_dir.joinpath(*parts))
+
+
+ICON_PATH = resource_path("icon.ico")
 
 # ==============================
 # 样式表（结构化管理）
@@ -371,7 +384,8 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         """初始化UI"""
         self.setWindowTitle(APP_TITLE)
-        self.setWindowIcon(QIcon("icon.ico"))
+        self.app_icon = QIcon(ICON_PATH)
+        self.setWindowIcon(self.app_icon)
         self.setFixedSize(*WINDOW_SIZE)
         self.setStyleSheet(Styles.get_style())
         # 设置无边框
@@ -408,7 +422,7 @@ class MainWindow(QMainWindow):
         btn_min = QPushButton("－")
         btn_min.setFixedSize(20, 20) # 再次缩小
         btn_min.setStyleSheet("QPushButton { background: transparent; color: #888; font-size: 12px; border: none; } QPushButton:hover { color: #ffffff; background: #333333; }")
-        btn_min.clicked.connect(self.showMinimized)
+        btn_min.clicked.connect(self.on_minimize_clicked)
         
         btn_close = QPushButton("×")
         btn_close.setFixedSize(20, 20) # 再次缩小
@@ -459,6 +473,12 @@ class MainWindow(QMainWindow):
             if self.minimize_to_tray and self.isMinimized():
                 QTimer.singleShot(0, self._hide_to_tray)
         super().changeEvent(event)
+
+    def on_minimize_clicked(self):
+        if self.minimize_to_tray and self.tray_icon:
+            self._hide_to_tray(show_notice=False)
+        else:
+            self.showMinimized()
 
     def closeEvent(self, event):
         if self._allow_close:
@@ -675,7 +695,8 @@ class MainWindow(QMainWindow):
         """初始化系统托盘"""
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        self.tray_icon = QSystemTrayIcon(QIcon("icon.ico"), self)
+        icon = self.app_icon if hasattr(self, "app_icon") else QIcon(ICON_PATH)
+        self.tray_icon = QSystemTrayIcon(icon, self)
         menu = QMenu()
         action_toggle = QAction("显示/隐藏", self)
         action_toggle.triggered.connect(self.toggle_visibility)
@@ -691,7 +712,7 @@ class MainWindow(QMainWindow):
     def load_settings(self):
         """加载本地设置"""
         autostart = self.settings.value(SETTINGS_AUTOSTART, False, type=bool)
-        minimize = self.settings.value(SETTINGS_MINIMIZE_TRAY, False, type=bool)
+        minimize = self.settings.value(SETTINGS_MINIMIZE_TRAY, True, type=bool)
 
         self.chk_autostart.blockSignals(True)
         self.chk_autostart.setChecked(autostart)
@@ -1021,7 +1042,15 @@ def run_gui():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
 
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        except Exception:
+            pass
+
     app_qt = QApplication(sys.argv)
+    app_qt.setWindowIcon(QIcon(ICON_PATH))
     window = MainWindow()
     window.show()
     sys.exit(app_qt.exec_())

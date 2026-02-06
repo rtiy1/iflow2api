@@ -33,6 +33,7 @@ def main():
         "--onefile",
         "--name", OUTPUT_NAME,
         "--icon", ICON,
+        "--add-data", f"{ICON};.",
         "--noconsole",
         "--hidden-import", "uvicorn.logging",
         "--hidden-import", "uvicorn.loops.auto",
