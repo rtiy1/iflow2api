@@ -5,18 +5,29 @@ import json
 import io
 import logging
 import asyncio
+import base64
+import mimetypes
+import os
+import re
+from urllib.parse import unquote
 from typing import AsyncIterator, Optional, Dict, Any, List
 
 # 重试配置
 MAX_RETRIES = 3
 RETRY_DELAY = 1.0  # 秒
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-from config import CONFIG
-from iflow_token import IFlowTokenStorage, load_token_from_file, save_token_to_file, refresh_oauth_tokens
-from thinking import apply_thinking
+from core.config import CONFIG
+from auth.token import IFlowTokenStorage, load_token_from_file, save_token_to_file, refresh_oauth_tokens
+from core.thinking import apply_thinking
 
 IFLOW_CLI_USER_AGENT = "iFlow-Cli"
 logger = logging.getLogger(__name__)
+MAX_LOCAL_IMAGE_BYTES = 10 * 1024 * 1024
+FORCED_VISION_MODEL = "qwen3-vl-plus"
+KNOWN_MULTIMODAL_MODELS = {
+    "qwen3-vl-plus",
+    "tstars2.0",
+}
 
 
 def remove_query_values_matching(url: str, key: str, match: str) -> str:
@@ -64,6 +75,195 @@ def is_streaming_response(content_type: str) -> bool:
     许多 JSON API 对普通响应使用 chunked encoding。
     """
     return "text/event-stream" in content_type
+
+
+def _normalize_base64_data(data: str) -> str:
+    if not data:
+        return ""
+    return "".join(data.split())
+
+
+def _build_data_url(media_type: str, data: str) -> str:
+    if not data:
+        return ""
+    if data.startswith("data:"):
+        return data
+    media_type = media_type or "image/png"
+    data = _normalize_base64_data(data)
+    if not data:
+        return ""
+    return f"data:{media_type};base64,{data}"
+
+
+def _to_local_path(url: str) -> str:
+    if not url:
+        return ""
+    value = url.strip()
+    if value.startswith("file://"):
+        path = unquote(value[7:])
+        if path.startswith("/"):
+            path = path.lstrip("/")
+        path = path.replace("/", os.sep)
+        # UNC path support (file://server/share)
+        if not re.match(r"^[A-Za-z]:\\", path) and path.startswith("\\") is False and value.startswith("file://"):
+            if "\\" not in path and "/" not in path:
+                return path
+            return "\\\\" + path.lstrip("\\")
+        return path
+    if re.match(r"^[A-Za-z]:\\", value) or re.match(r"^[A-Za-z]:/", value):
+        return unquote(value).replace("/", os.sep)
+    return ""
+
+
+def _load_local_image_as_data_url(url: str) -> str:
+    path = _to_local_path(url)
+    if not path:
+        return ""
+    if not os.path.exists(path):
+        logger.warning(f"[iFlow] 本地图片路径不存在: {path}")
+        return ""
+    try:
+        size = os.path.getsize(path)
+        if size > MAX_LOCAL_IMAGE_BYTES:
+            logger.warning(f"[iFlow] 本地图片过大，已跳过: {path} ({size} bytes)")
+            return ""
+        with open(path, "rb") as f:
+            data = f.read()
+        media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        encoded = base64.b64encode(data).decode("ascii")
+        return f"data:{media_type};base64,{encoded}"
+    except Exception as e:
+        logger.warning(f"[iFlow] 读取本地图片失败: {path} ({e})")
+        return ""
+
+
+def _normalize_image_url(url: str) -> str:
+    if not url:
+        return ""
+    value = url.strip()
+    if value.startswith("data:") or value.startswith("http://") or value.startswith("https://"):
+        return value
+    if CONFIG.get("allow_local_file_images"):
+        local_data = _load_local_image_as_data_url(value)
+        if local_data:
+            return local_data
+    return value
+
+
+def _extract_image_url_from_part(part: Dict[str, Any]) -> str:
+    if not isinstance(part, dict):
+        return ""
+
+    image_url_field = part.get("image_url")
+    if isinstance(image_url_field, dict):
+        url = image_url_field.get("url", "")
+        if url:
+            return _normalize_image_url(url)
+    elif isinstance(image_url_field, str):
+        return _normalize_image_url(image_url_field)
+
+    url_field = part.get("url")
+    if isinstance(url_field, str) and url_field:
+        return _normalize_image_url(url_field)
+
+    source = part.get("source")
+    if isinstance(source, dict):
+        source_type = source.get("type", "")
+        if source_type == "url":
+            return _normalize_image_url(source.get("url", ""))
+        if source_type == "base64":
+            media_type = source.get("media_type") or part.get("media_type") or "image/png"
+            return _build_data_url(media_type, source.get("data", ""))
+
+    return ""
+
+
+def _build_image_url_part(part: Dict[str, Any], url: str) -> Dict[str, Any]:
+    image_url = {"url": url}
+    detail = None
+    image_url_field = part.get("image_url")
+    if isinstance(image_url_field, dict):
+        detail = image_url_field.get("detail")
+    if detail is None:
+        detail = part.get("detail")
+    if detail:
+        image_url["detail"] = detail
+    return {"type": "image_url", "image_url": image_url}
+
+
+def _normalize_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize image content blocks to OpenAI image_url format."""
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        normalized = []
+        changed = False
+
+        for part in content:
+            if isinstance(part, dict):
+                part_type = part.get("type", "")
+                if part_type == "input_text" and "text" in part:
+                    normalized.append({"type": "text", "text": part.get("text", "")})
+                    changed = True
+                    continue
+                is_image_like = part_type in ("image", "image_url", "input_image") or "image_url" in part or "source" in part
+                if is_image_like:
+                    url = _extract_image_url_from_part(part)
+                    if url:
+                        normalized.append(_build_image_url_part(part, url))
+                        changed = True
+                        continue
+
+            normalized.append(part)
+
+        if changed:
+            msg["content"] = normalized
+
+    return messages
+
+
+def _message_has_image(message: Dict[str, Any]) -> bool:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type", "")
+        if part_type in ("image", "image_url", "input_image"):
+            return True
+        if "image_url" in part:
+            return True
+        source = part.get("source")
+        if isinstance(source, dict) and source.get("type") in ("base64", "url"):
+            return True
+    return False
+
+
+def _request_has_images(body: Dict[str, Any]) -> bool:
+    messages = body.get("messages", [])
+    if not isinstance(messages, list):
+        return False
+    return any(_message_has_image(msg) for msg in messages)
+
+
+def _is_vision_model(model: str) -> bool:
+    if not model:
+        return False
+    model_lower = model.lower()
+    return (
+        model_lower in KNOWN_MULTIMODAL_MODELS
+        or "vl" in model_lower
+        or "vision" in model_lower
+        or "4v" in model_lower
+        or "multimodal" in model_lower
+    )
+
+
+def _forced_model_is_multimodal() -> bool:
+    return _is_vision_model(FORCED_VISION_MODEL)
 
 
 def get_default_system_prompt() -> str:
@@ -166,6 +366,8 @@ class ReverseProxy:
         # 注入默认系统提示词
         default_prompt = get_default_system_prompt()
         messages = processed.get("messages", [])
+        if isinstance(messages, list):
+            _normalize_openai_messages(messages)
 
         # 查找是否已有 system 消息
         system_msg_idx = None
@@ -225,8 +427,16 @@ class ReverseProxy:
         """代理请求"""
         await self.initialize()
 
+        effective_model = model
+        if _request_has_images(body) and not _is_vision_model(model):
+            if not _forced_model_is_multimodal():
+                logger.warning(f"[iFlow] 强制模型不支持多模态，跳过切换: {FORCED_VISION_MODEL}")
+            else:
+                logger.info(f"[iFlow] 检测到图片输入，强制切换模型: {model} -> {FORCED_VISION_MODEL}")
+                effective_model = FORCED_VISION_MODEL
+
         # 修改请求体
-        processed_body = self._modify_request_body(body, model)
+        processed_body = self._modify_request_body(body, effective_model)
 
         # 修改请求头
         headers = self._director({})

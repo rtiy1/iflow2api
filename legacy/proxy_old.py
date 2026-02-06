@@ -5,9 +5,9 @@ import asyncio
 import json
 import gzip
 from typing import AsyncIterator, Optional
-from config import CONFIG
-from iflow_token import IFlowTokenStorage, load_token_from_file, save_token_to_file, refresh_oauth_tokens
-from thinking import apply_thinking
+from core.config import CONFIG
+from auth.token import IFlowTokenStorage, load_token_from_file, save_token_to_file, refresh_oauth_tokens
+from core.thinking import apply_thinking
 
 
 # iFlow CLI 特殊 User-Agent，用于解锁更多模型

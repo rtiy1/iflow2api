@@ -4,6 +4,13 @@ import uuid
 from typing import Dict, Any, List, Optional
 
 
+def _normalize_base64_data(data: str) -> str:
+    """Remove whitespace/newlines from base64 data."""
+    if not data:
+        return ""
+    return "".join(data.split())
+
+
 def anthropic_to_openai(req: dict) -> dict:
     """将 Anthropic 请求转换为 OpenAI 格式"""
     out = {"model": "", "messages": []}
@@ -95,7 +102,7 @@ def anthropic_to_openai(req: dict) -> dict:
                     # 忽略 redacted_thinking
                     pass
 
-                elif block_type in ("text", "image"):
+                elif block_type in ("text", "image", "input_text", "input_image", "image_url"):
                     if part := _convert_content_part(block):
                         content_items.append(part)
 
@@ -196,26 +203,37 @@ def _convert_content_part(part: dict) -> Optional[dict]:
     """转换内容块"""
     part_type = part.get("type", "")
 
-    if part_type == "text":
+    if part_type in ("text", "input_text"):
         text = part.get("text", "")
         if text.strip():
             return {"type": "text", "text": text}
 
-    elif part_type == "image":
+    elif part_type in ("image", "input_image", "image_url"):
         image_url = ""
         if "source" in part:
             source = part["source"]
             source_type = source.get("type", "")
             if source_type == "base64":
-                media_type = source.get("media_type", "application/octet-stream")
-                data = source.get("data", "")
+                media_type = source.get("media_type") or "image/png"
+                data = _normalize_base64_data(source.get("data", ""))
                 if data:
-                    image_url = f"data:{media_type};base64,{data}"
+                    if data.startswith("data:"):
+                        image_url = data
+                    else:
+                        image_url = f"data:{media_type};base64,{data}"
             elif source_type == "url":
                 image_url = source.get("url", "")
         elif "url" in part:
             image_url = part["url"]
 
+        if not image_url:
+            image_url_field = part.get("image_url")
+            if isinstance(image_url_field, dict):
+                image_url = image_url_field.get("url", "")
+            elif isinstance(image_url_field, str):
+                image_url = image_url_field
+        if not image_url:
+            image_url = part.get("url", "")
         if image_url:
             return {"type": "image_url", "image_url": {"url": image_url}}
 
