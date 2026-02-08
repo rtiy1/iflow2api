@@ -3,11 +3,11 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QFrame, QGridLayout,
     QProgressBar, QSizePolicy, QScrollArea, QTextEdit,
-    QGraphicsDropShadowEffect, QDialog, QCheckBox,
+    QGraphicsDropShadowEffect, QDialog, QCheckBox, QMessageBox,
     QSystemTrayIcon, QMenu, QAction
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, QSize, pyqtSignal, pyqtSlot, QThread, QPoint, QSettings
+    Qt, QTimer, QSize, pyqtSignal, pyqtSlot, QThread, QPoint, QSettings, QLockFile
 )
 from PyQt5.QtGui import QFont, QColor, QPainter, QIntValidator, QCursor, QIcon
 import sys
@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from datetime import datetime
 from app.server import app, request_logs, stats, CONFIG
+from proxy.proxy import get_proxy
 
 start_time = time.time()
 
@@ -35,10 +36,10 @@ PORT_MIN = 1024
 PORT_MAX = 65535
 DEFAULT_PORT = 8000
 LOGO_TEXT = "IFLOW\nTO API"
-VERSION_TEXT = "永久版"
 APP_ID = "iFlow2API"
 SETTINGS_AUTOSTART = "autostart_enabled"
 STARTUP_BAT_NAME = "iFlow2API_Autostart.bat"
+GUI_LOCK_FILE = Path.home() / ".iflow2api" / "iflow2api-gui.lock"
 
 
 def resource_path(*parts: str) -> str:
@@ -408,7 +409,7 @@ class MainWindow(QMainWindow):
         title_info = QHBoxLayout()
         icon_label = QLabel("🔆") 
         icon_label.setStyleSheet("font-size: 10px; color: #ff7733;")
-        title_text = QLabel("畅享 Claude Code")
+        title_text = QLabel("iFlow2API")
         title_text.setStyleSheet("font-family: 'Microsoft YaHei'; font-size: 10px; color: #bbbbbb; font-weight: bold;")
         title_info.addWidget(icon_label)
         title_info.addWidget(title_text)
@@ -512,8 +513,8 @@ class MainWindow(QMainWindow):
 
         # 右侧统计网格
         stats_layout = QGridLayout()
-        stats_layout.setHorizontalSpacing(10)
-        stats_layout.setVerticalSpacing(5)
+        stats_layout.setHorizontalSpacing(8)
+        stats_layout.setVerticalSpacing(6)
 
         # 状态
         lbl = QLabel("状态")
@@ -531,7 +532,7 @@ class MainWindow(QMainWindow):
         self.prog_bar = QProgressBar()
         self.prog_bar.setRange(0, 100)
         self.prog_bar.setValue(0)
-        self.prog_bar.setFixedSize(100, 6)
+        self.prog_bar.setFixedSize(88, 6)
         self.rate_val = QLabel("0.0%")
         self.rate_val.setProperty("class", "StatValue")
         prog_container = QWidget()
@@ -554,18 +555,11 @@ class MainWindow(QMainWindow):
         lbl.setProperty("class", "StatLabel")
         stats_layout.addWidget(lbl, 3, 0, Qt.AlignRight)
         self.port_input = QLineEdit(str(DEFAULT_PORT))
-        self.port_input.setFixedWidth(50)
+        self.port_input.setFixedWidth(62)
+        self.port_input.setFixedHeight(22)
         # 仅允许输入数字，且范围在1024-65535
         self.port_input.setValidator(QIntValidator(PORT_MIN, PORT_MAX))
         stats_layout.addWidget(self.port_input, 3, 1)
-
-        # 版本
-        lbl = QLabel("版本")
-        lbl.setProperty("class", "StatLabel")
-        stats_layout.addWidget(lbl, 4, 0, Qt.AlignRight)
-        version_lbl = QLabel(VERSION_TEXT)
-        version_lbl.setProperty("class", "StatValue")
-        stats_layout.addWidget(version_lbl, 4, 1)
 
         top_layout.addLayout(stats_layout)
         parent_layout.addWidget(top_frame)
@@ -602,7 +596,7 @@ class MainWindow(QMainWindow):
         self.btn_health.clicked.connect(self.check_health)
         self.btn_health.setProperty("class", "ActionBtn")
 
-        self.btn_sysinfo = QPushButton("系统信息")
+        self.btn_sysinfo = QPushButton("模型列表")
         self.btn_sysinfo.clicked.connect(self.show_system_info)
         self.btn_sysinfo.setProperty("class", "ActionBtn")
 
@@ -936,28 +930,51 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def show_system_info(self):
-        """显示系统信息对话框"""
-        uptime_seconds = int(time.time() - start_time)
-        hours = uptime_seconds // 3600
-        minutes = (uptime_seconds % 3600) // 60
-        uptime_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+        """显示模型列表对话框"""
+        info = "正在加载模型列表..."
+        try:
+            import httpx
 
-        info = f"""Python版本: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}
-平台: {platform.system()} {platform.release()}
-CPU使用: {psutil.cpu_percent(interval=0.1):.1f}%
-内存使用: {psutil.virtual_memory().percent:.1f}%
-运行时间: {uptime_str}
-进程PID: {os.getpid()}"""
+            if self.server_manager.is_running:
+                response = httpx.get(f"http://localhost:{self.current_port}/v1/models", timeout=10.0)
+                response.raise_for_status()
+                payload = response.json()
+            else:
+                proxy = get_proxy()
+                loop = asyncio.new_event_loop()
+                try:
+                    asyncio.set_event_loop(loop)
+                    payload = loop.run_until_complete(proxy.get_models())
+                finally:
+                    loop.close()
+                    asyncio.set_event_loop(None)
+
+            model_ids: List[str] = []
+            data = payload.get("data", [])
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        model_id = item.get("id")
+                        if isinstance(model_id, str) and model_id:
+                            model_ids.append(model_id)
+
+            if model_ids:
+                model_lines = "\n".join(f"- {model_id}" for model_id in model_ids)
+                info = f"模型总数: {len(model_ids)}\n\n{model_lines}"
+            else:
+                info = "模型列表为空"
+        except Exception as e:
+            info = f"获取模型列表失败:\n{e}"
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("系统信息")
-        dialog.setFixedSize(300, 200)
+        dialog.setWindowTitle("模型列表")
+        dialog.setFixedSize(420, 320)
         dialog.setStyleSheet(Styles.get_style())
         layout = QVBoxLayout(dialog)
         text = QTextEdit()
         text.setReadOnly(True)
         text.setText(info)
-        text.setStyleSheet("QTextEdit { background: #1a0d05; color: #ff9966; border: 1px solid #ff5500; padding: 10px; }")
+        text.setStyleSheet("QTextEdit { background: #1a0d05; color: #ff9966; border: 1px solid #ff5500; padding: 10px; font-family: 'Consolas', monospace; font-size: 9px; }")
         layout.addWidget(text)
         dialog.exec_()
 
@@ -1014,6 +1031,15 @@ def run_gui():
 
     app_qt = QApplication(sys.argv)
     app_qt.setWindowIcon(QIcon(ICON_PATH))
+
+    GUI_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    single_instance_lock = QLockFile(str(GUI_LOCK_FILE))
+    single_instance_lock.setStaleLockTime(0)
+    if not single_instance_lock.tryLock(0):
+        QMessageBox.information(None, APP_TITLE, "程序已经在运行中。")
+        return
+    app_qt.single_instance_lock = single_instance_lock
+
     window = MainWindow()
     window.show()
     sys.exit(app_qt.exec_())

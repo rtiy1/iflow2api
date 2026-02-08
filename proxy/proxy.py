@@ -9,6 +9,7 @@ import base64
 import mimetypes
 import os
 import re
+import copy
 from urllib.parse import unquote
 from typing import AsyncIterator, Optional, Dict, Any, List
 
@@ -28,6 +29,10 @@ KNOWN_MULTIMODAL_MODELS = {
     "qwen3-vl-plus",
     "tstars2.0",
 }
+FORCE_VISION_MODEL_SERIES_PREFIXES = (
+    "glm",
+    "minimax",
+)
 EXTRA_MODELS = [
     "glm-4.7",
     "minimax-m2.1",
@@ -254,6 +259,42 @@ def _request_has_images(body: Dict[str, Any]) -> bool:
     return any(_message_has_image(msg) for msg in messages)
 
 
+def _is_image_part(part: Dict[str, Any]) -> bool:
+    if not isinstance(part, dict):
+        return False
+    part_type = part.get("type", "")
+    if part_type in ("image", "image_url", "input_image"):
+        return True
+    if "image_url" in part:
+        return True
+    source = part.get("source")
+    return isinstance(source, dict) and source.get("type") in ("base64", "url")
+
+
+def _strip_images_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sanitized: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            sanitized.append(message)
+            continue
+
+        msg = copy.deepcopy(message)
+        content = msg.get("content")
+        if isinstance(content, list):
+            filtered: List[Any] = []
+            for part in content:
+                if isinstance(part, dict):
+                    if _is_image_part(part):
+                        continue
+                    if part.get("type") == "input_text":
+                        filtered.append({"type": "text", "text": part.get("text", "")})
+                        continue
+                filtered.append(part)
+            msg["content"] = filtered
+        sanitized.append(msg)
+    return sanitized
+
+
 def _is_vision_model(model: str) -> bool:
     if not model:
         return False
@@ -269,6 +310,101 @@ def _is_vision_model(model: str) -> bool:
 
 def _forced_model_is_multimodal() -> bool:
     return _is_vision_model(FORCED_VISION_MODEL)
+
+
+def _should_force_vision_for_series(model: str) -> bool:
+    if not model:
+        return False
+    model_lower = model.lower()
+    return any(model_lower.startswith(prefix) for prefix in FORCE_VISION_MODEL_SERIES_PREFIXES)
+
+
+def _extract_error_text(exc: Exception) -> str:
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return ""
+    try:
+        return (exc.response.text or "").lower()
+    except Exception:
+        return ""
+
+
+def _looks_like_image_capability_error(exc: Exception) -> bool:
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+
+    status = exc.response.status_code
+    if status not in (400, 415, 422):
+        return False
+
+    text = _extract_error_text(exc)
+    if not text:
+        return False
+
+    image_tokens = [
+        "image",
+        "image_url",
+        "input_image",
+        "vision",
+        "multimodal",
+        "图片",
+        "图像",
+        "视觉",
+        "多模态",
+    ]
+    unsupported_tokens = [
+        "not support",
+        "unsupported",
+        "invalid",
+        "must be text",
+        "only text",
+        "不支持",
+        "无效",
+        "仅支持文本",
+    ]
+    return any(token in text for token in image_tokens) and any(token in text for token in unsupported_tokens)
+
+
+def _should_fallback_to_forced_vision(exc: Exception, *, model: str, has_images: bool) -> bool:
+    if not has_images:
+        return False
+    if not model:
+        return False
+    if not _should_force_vision_for_series(model):
+        return False
+    if model.lower() == FORCED_VISION_MODEL.lower():
+        return False
+    if _is_vision_model(model):
+        return False
+    if not _forced_model_is_multimodal():
+        return False
+    return _looks_like_image_capability_error(exc)
+
+
+def _extract_text_from_result(result: Dict[str, Any]) -> str:
+    choices = result.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return ""
+
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+
+    message = first.get("message", {})
+    if not isinstance(message, dict):
+        return ""
+
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                text = part.get("text", "").strip()
+                if text:
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
 
 
 def _append_extra_models(payload: Any) -> Dict[str, Any]:
@@ -468,27 +604,109 @@ class ReverseProxy:
         await self.initialize()
 
         effective_model = model
-        if _request_has_images(body) and not _is_vision_model(model):
-            if not _forced_model_is_multimodal():
-                logger.warning(f"[iFlow] 强制模型不支持多模态，跳过切换: {FORCED_VISION_MODEL}")
-            else:
-                logger.info(f"[iFlow] 检测到图片输入，强制切换模型: {model} -> {FORCED_VISION_MODEL}")
-                effective_model = FORCED_VISION_MODEL
+        has_images = _request_has_images(body)
+        working_body = body
 
-        # 修改请求体
-        processed_body = self._modify_request_body(body, effective_model)
-
-        # 修改请求头
         headers = self._director({})
-
         client = await self._get_client()
 
-        if stream:
-            return self._proxy_stream(client, endpoint, headers, processed_body)
-        else:
-            return await self._proxy_non_stream(client, endpoint, headers, processed_body)
+        if has_images:
+            if _should_force_vision_for_series(model):
+                if _forced_model_is_multimodal():
+                    logger.info(f"[iFlow] 检测到图片输入，模型属于两段式处理系列: {model} -> {FORCED_VISION_MODEL} -> {model}")
+                    try:
+                        vision_summary = await self._generate_vision_summary(client, headers, endpoint, body, model)
+                        if vision_summary:
+                            logger.info(f"[iFlow] 视觉解析完成，摘要长度: {len(vision_summary)}")
+                            working_body = self._build_two_stage_main_body(body, vision_summary)
+                            has_images = _request_has_images(working_body)
+                            effective_model = model
+                        else:
+                            logger.warning(f"[iFlow] 视觉解析结果为空，回退为直接视觉模型输出: {FORCED_VISION_MODEL}")
+                            effective_model = FORCED_VISION_MODEL
+                    except Exception as e:
+                        logger.warning(f"[iFlow] 两段式视觉解析失败，回退为直接视觉模型输出: {e}")
+                        effective_model = FORCED_VISION_MODEL
+                else:
+                    logger.warning(f"[iFlow] 强制模型不支持多模态，跳过切换: {FORCED_VISION_MODEL}")
 
-    async def _proxy_non_stream(self, client: httpx.AsyncClient, endpoint: str, headers: Dict[str, str], body: Dict[str, Any]):
+        # 修改请求体
+        processed_body = self._modify_request_body(working_body, effective_model)
+
+        if stream:
+            return self._proxy_stream(client, endpoint, headers, processed_body, model=effective_model, has_images=has_images)
+        else:
+            return await self._proxy_non_stream(client, endpoint, headers, processed_body, model=effective_model, has_images=has_images)
+
+    async def _generate_vision_summary(
+        self,
+        client: httpx.AsyncClient,
+        headers: Dict[str, str],
+        endpoint: str,
+        body: Dict[str, Any],
+        model: str,
+    ) -> str:
+        vision_body = copy.deepcopy(body)
+        vision_body["stream"] = False
+        vision_body.pop("stream_options", None)
+        vision_body.pop("tools", None)
+        vision_body.pop("tool_choice", None)
+        vision_body.pop("response_format", None)
+        vision_body.pop("thinking", None)
+        vision_body["max_tokens"] = 1024
+        messages = vision_body.get("messages", [])
+        if not isinstance(messages, list):
+            return ""
+
+        instruction = (
+            f"你是图片解析助手。当前主模型是 {model}，它不处理图片。"
+            "请读取用户上传的图片并输出可供文本模型继续推理的结构化摘要。"
+            "必须包含：1) 图片主体与场景；2) 图片中的文字原文；3) 与用户问题相关的关键细节。"
+            "不要说看不到图片，不要输出多余客套。"
+        )
+        vision_body["messages"] = [{"role": "system", "content": instruction}] + messages
+        processed_vision_body = self._modify_request_body(vision_body, FORCED_VISION_MODEL)
+
+        result = await self._proxy_non_stream(
+            client,
+            endpoint,
+            headers,
+            processed_vision_body,
+            model=FORCED_VISION_MODEL,
+            has_images=True,
+            allow_vision_fallback=False,
+        )
+        return _extract_text_from_result(result)
+
+    def _build_two_stage_main_body(self, body: Dict[str, Any], vision_summary: str) -> Dict[str, Any]:
+        main_body = copy.deepcopy(body)
+        messages = main_body.get("messages", [])
+        if not isinstance(messages, list):
+            messages = []
+        sanitized_messages = _strip_images_from_messages(messages)
+
+        bridge_system_msg = {
+            "role": "system",
+            "content": (
+                "以下是视觉模型对用户图片的解析结果，请将其作为用户提供的图片事实继续回答。\n"
+                f"{vision_summary}"
+            ),
+        }
+
+        main_body["messages"] = [bridge_system_msg] + sanitized_messages
+        return main_body
+
+    async def _proxy_non_stream(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        headers: Dict[str, str],
+        body: Dict[str, Any],
+        *,
+        model: str,
+        has_images: bool,
+        allow_vision_fallback: bool = True,
+    ):
         """非流式代理 - 带重试"""
         last_error = None
         for attempt in range(MAX_RETRIES):
@@ -510,6 +728,19 @@ class ReverseProxy:
 
                 return result
             except httpx.HTTPStatusError as e:
+                if allow_vision_fallback and _should_fallback_to_forced_vision(e, model=model, has_images=has_images):
+                    logger.info(f"[iFlow] 原模型不支持图片输入，回退视觉模型: {model} -> {FORCED_VISION_MODEL}")
+                    fallback_body = body.copy()
+                    fallback_body["model"] = FORCED_VISION_MODEL
+                    return await self._proxy_non_stream(
+                        client,
+                        endpoint,
+                        headers,
+                        fallback_body,
+                        model=FORCED_VISION_MODEL,
+                        has_images=has_images,
+                        allow_vision_fallback=False,
+                    )
                 last_error = e
                 status_code = e.response.status_code
                 logger.warning(f"上游 API 错误 (尝试 {attempt + 1}/{MAX_RETRIES}): HTTP {status_code} - {e}")
@@ -528,7 +759,17 @@ class ReverseProxy:
             logger.error(f"代理请求失败 for POST {endpoint}: {last_error}")
         raise last_error
 
-    async def _proxy_stream(self, client: httpx.AsyncClient, endpoint: str, headers: Dict[str, str], body: Dict[str, Any]) -> AsyncIterator[bytes]:
+    async def _proxy_stream(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        headers: Dict[str, str],
+        body: Dict[str, Any],
+        *,
+        model: str,
+        has_images: bool,
+        allow_vision_fallback: bool = True,
+    ) -> AsyncIterator[bytes]:
         """流式代理 - 按 SSE 事件边界读取
 
         SSE 格式：data: {...}\n\n
@@ -558,6 +799,24 @@ class ReverseProxy:
                 # 处理剩余数据（如果有）
                 if buffer:
                     yield buffer
+        except httpx.HTTPStatusError as e:
+            if allow_vision_fallback and _should_fallback_to_forced_vision(e, model=model, has_images=has_images):
+                logger.info(f"[iFlow] 原模型不支持图片输入，流式回退视觉模型: {model} -> {FORCED_VISION_MODEL}")
+                fallback_body = body.copy()
+                fallback_body["model"] = FORCED_VISION_MODEL
+                async for chunk in self._proxy_stream(
+                    client,
+                    endpoint,
+                    headers,
+                    fallback_body,
+                    model=FORCED_VISION_MODEL,
+                    has_images=has_images,
+                    allow_vision_fallback=False,
+                ):
+                    yield chunk
+                return
+            logger.error(f"amp upstream proxy error for POST {endpoint}: {e}")
+            raise
         except Exception as e:
             logger.error(f"amp upstream proxy error for POST {endpoint}: {e}")
             raise

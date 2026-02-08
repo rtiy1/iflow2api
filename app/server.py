@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 # 请求日志存储
 request_logs = deque(maxlen=100)
 stats = {"total": 0, "success": 0, "error": 0}
-from proxy.context_compressor import compress_context
 from converters import (
     anthropic_to_openai,
     openai_to_anthropic_nonstream,
@@ -494,11 +493,6 @@ async def chat_completions(request: Request):
     try:
         proxy = get_proxy()
 
-        # 上下文压缩
-        compressed_messages, compress_stats = await compress_context(messages, proxy)
-        if compress_stats["removed_count"] > 0:
-            body["messages"] = compressed_messages
-
         if body.get("stream"):
             body["stream_options"] = {"include_usage": True}
             import json as _json
@@ -681,12 +675,6 @@ async def anthropic_messages(request: Request):
 
     try:
         proxy = get_proxy()
-
-        # 上下文压缩
-        messages = openai_req.get("messages", [])
-        compressed_messages, compress_stats = await compress_context(messages, proxy)
-        if compress_stats["removed_count"] > 0:
-            openai_req["messages"] = compressed_messages
 
         if body.get("stream"):
             openai_req["stream_options"] = {"include_usage": True}
