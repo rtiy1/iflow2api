@@ -1,8 +1,4 @@
-"""Thinking configuration module for iFlow API proxy.
 
-Based on CLIProxyAPI's thinking architecture, adapted for Python.
-Handles thinking configuration extraction, validation, and application.
-"""
 
 import re
 from enum import Enum

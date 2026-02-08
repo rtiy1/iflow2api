@@ -507,25 +507,13 @@ class ReverseProxy:
             await self._client.aclose()
 
     def _director(self, headers: Dict[str, str]) -> Dict[str, str]:
-        """修改请求头（Director）
 
-        参考 Go: proxy.Director = func(req *http.Request)
-        - 删除客户端的 Authorization 头（仅用于 CLI Proxy API 认证）
-        - 注入上游 API key
-
-        注意：我们不在代理路径中过滤 Anthropic-Beta 头。
-        通过 ampcode.com 代理的用户为服务付费，应该获得所有功能，
-        包括 1M 上下文窗口 (context-1m-2025-08-07)。
-        """
         modified = headers.copy()
 
-        # 删除客户端的 Authorization 头 - 它仅用于 CLI Proxy API 认证
-        # 我们将使用配置的 upstream-api-key 设置自己的 Authorization
         modified.pop("authorization", None)
         modified.pop("x-api-key", None)
         modified.pop("x-goog-api-key", None)
 
-        # 注入上游 API key（仅使用配置中的 upstream-api-key）
         modified["x-api-key"] = self.api_key
         modified["authorization"] = f"Bearer {self.api_key}"
         modified["user-agent"] = IFLOW_CLI_USER_AGENT
@@ -770,11 +758,7 @@ class ReverseProxy:
         has_images: bool,
         allow_vision_fallback: bool = True,
     ) -> AsyncIterator[bytes]:
-        """流式代理 - 按 SSE 事件边界读取
 
-        SSE 格式：data: {...}\n\n
-        每个事件由 data: 行和空行组成，空行表示事件结束
-        """
         try:
             async with client.stream(
                 "POST",
