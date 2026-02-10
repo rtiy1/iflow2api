@@ -6,9 +6,13 @@ import io
 import logging
 import asyncio
 import base64
+import hashlib
+import hmac
 import mimetypes
 import os
 import re
+import time
+import uuid
 import copy
 from urllib.parse import unquote
 from typing import AsyncIterator, Optional, Dict, Any, List
@@ -37,7 +41,17 @@ EXTRA_MODELS = [
     "glm-4.7",
     "minimax-m2.1",
     "kimi-k2.5",
+    "iflow-rome-30ba3b",
 ]
+
+
+def _create_iflow_signature(user_agent: str, session_id: str, timestamp_ms: int, api_key: str) -> str:
+
+    if not api_key:
+        return ""
+
+    payload = f"{user_agent}:{session_id}:{timestamp_ms}"
+    return hmac.new(api_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def remove_query_values_matching(url: str, key: str, match: str) -> str:
@@ -513,11 +527,31 @@ class ReverseProxy:
         modified.pop("authorization", None)
         modified.pop("x-api-key", None)
         modified.pop("x-goog-api-key", None)
+        modified.pop("x-iflow-timestamp", None)
+        modified.pop("x-iflow-signature", None)
+        modified.pop("session-id", None)
 
         modified["x-api-key"] = self.api_key
         modified["authorization"] = f"Bearer {self.api_key}"
         modified["user-agent"] = IFLOW_CLI_USER_AGENT
         modified["content-type"] = "application/json"
+
+        return modified
+
+    def _apply_iflow_security_headers(self, headers: Dict[str, str]) -> Dict[str, str]:
+
+        modified = headers.copy()
+        session_id = f"session-{uuid.uuid4()}"
+        timestamp_ms = int(time.time() * 1000)
+
+        modified["session-id"] = session_id
+        modified["x-iflow-timestamp"] = str(timestamp_ms)
+
+        signature = _create_iflow_signature(IFLOW_CLI_USER_AGENT, session_id, timestamp_ms, self.api_key)
+        if signature:
+            modified["x-iflow-signature"] = signature
+        else:
+            modified.pop("x-iflow-signature", None)
 
         return modified
 
@@ -699,9 +733,10 @@ class ReverseProxy:
         last_error = None
         for attempt in range(MAX_RETRIES):
             try:
+                request_headers = self._apply_iflow_security_headers(headers)
                 response = await client.post(
                     f"{self.upstream_url}{endpoint}",
-                    headers=headers,
+                    headers=request_headers,
                     json=body,
                 )
                 response.raise_for_status()
@@ -760,10 +795,11 @@ class ReverseProxy:
     ) -> AsyncIterator[bytes]:
 
         try:
+            request_headers = self._apply_iflow_security_headers(headers)
             async with client.stream(
                 "POST",
                 f"{self.upstream_url}{endpoint}",
-                headers=headers,
+                headers=request_headers,
                 json=body,
             ) as response:
                 response.raise_for_status()
@@ -813,9 +849,10 @@ class ReverseProxy:
         client = await self._get_client()
 
         try:
+            request_headers = self._apply_iflow_security_headers(headers)
             response = await client.get(
                 f"{self.upstream_url}/models",
-                headers=headers
+                headers=request_headers
             )
             response.raise_for_status()
 
