@@ -21,6 +21,8 @@ import os
 import time
 from pathlib import Path
 from datetime import datetime
+from collections import deque
+import html
 from app.server import app, request_logs, stats, CONFIG
 from proxy.proxy import get_proxy
 
@@ -368,13 +370,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.server_manager = ServerManager()
-        self.last_log = ""  # 缓存最后一条日志，避免重复更新
+        self.log_entries = deque(maxlen=200)
+        self.seen_request_keys = set()
         self.current_port = DEFAULT_PORT
         self.settings = QSettings(APP_ID, "Console")
         self.tray_icon = None
         self._allow_close = False
         self.log_signal.connect(self.update_log)
         self.init_ui()
+        self.update_log("系统就绪 / Waiting for commands...", level="info")
         self.init_tray()
         self.load_settings()
         self.init_timer()
@@ -655,7 +659,7 @@ class MainWindow(QMainWindow):
         self.log_text.setProperty("class", "LogText")
         self.log_text.setReadOnly(True)
         self.log_text.setMinimumHeight(80) # 进一步压缩最小高度
-        self.log_text.setText("系统就绪 / Waiting for commands...")
+        self.log_text.setHtml("")
 
         log_layout.addLayout(log_title_layout)
         log_layout.addWidget(self.log_text)
@@ -700,19 +704,19 @@ class MainWindow(QMainWindow):
         if autostart:
             ok, msg = self._set_autostart_enabled(True)
             if not ok:
-                self.update_log(msg)
+                self.update_log(msg, level="warning")
                 self.chk_autostart.setChecked(False)
 
     def on_autostart_toggled(self, checked: bool):
         ok, msg = self._set_autostart_enabled(checked)
         if not ok:
-            self.update_log(msg)
+            self.update_log(msg, level="warning")
             self.chk_autostart.blockSignals(True)
             self.chk_autostart.setChecked(not checked)
             self.chk_autostart.blockSignals(False)
             return
         self.settings.setValue(SETTINGS_AUTOSTART, checked)
-        self.update_log("开机自启已开启" if checked else "开机自启已关闭")
+        self.update_log("开机自启已开启" if checked else "开机自启已关闭", level="info")
 
     def _get_startup_dir(self) -> str:
         appdata = os.environ.get("APPDATA", "")
@@ -779,12 +783,12 @@ class MainWindow(QMainWindow):
         self.btn_start.setText("停止服务")
         self.port_input.setEnabled(False)
         self.btn_admin.setEnabled(True)
-        self.update_log(f"服务已启动，端口：{self.current_port}")
+        self.update_log(f"服务已启动，端口：{self.current_port}", level="success")
 
     @pyqtSlot(str)
     def on_server_error(self, error_msg: str):
         """服务器错误回调"""
-        self.update_log(error_msg)
+        self.update_log(error_msg, level="error")
 
     @pyqtSlot()
     def toggle_server(self):
@@ -794,15 +798,15 @@ class MainWindow(QMainWindow):
             try:
                 port = int(self.port_input.text())
                 if not (PORT_MIN <= port <= PORT_MAX):
-                    self.update_log(f"错误：端口必须在{PORT_MIN}-{PORT_MAX}之间")
+                    self.update_log(f"错误：端口必须在{PORT_MIN}-{PORT_MAX}之间", level="warning")
                     return
 
                 self.current_port = port
                 self.server_manager.start(port, self.on_server_started, self.on_server_error)
             except ValueError:
-                self.update_log("错误：端口必须是数字")
+                self.update_log("错误：端口必须是数字", level="warning")
             except Exception as e:
-                self.update_log(f"启动失败：{str(e)}")
+                self.update_log(f"启动失败：{str(e)}", level="error")
         else:
             # 停止服务
             self.server_manager.stop()
@@ -811,7 +815,7 @@ class MainWindow(QMainWindow):
             self.btn_start.setText("启动服务")
             self.port_input.setEnabled(True)
             self.btn_admin.setEnabled(False)
-            self.update_log("服务已停止")
+            self.update_log("服务已停止", level="warning")
 
     @pyqtSlot()
     def open_admin_panel(self):
@@ -820,7 +824,7 @@ class MainWindow(QMainWindow):
             port = int(self.port_input.text())
             webbrowser.open(f"http://127.0.0.1:{port}/admin")
         except Exception as e:
-            self.update_log(f"打开管理面板失败：{str(e)}")
+            self.update_log(f"打开管理面板失败：{str(e)}", level="error")
 
     @pyqtSlot()
     def update_stats(self):
@@ -842,27 +846,65 @@ class MainWindow(QMainWindow):
                 self.prog_bar.setValue(0)
                 self.rate_val.setText("0.0%")
 
-        # 更新最新日志（仅日志变化时更新）
+        # 更新请求日志（按 request_id 去重，按状态着色）
         if request_logs:
-            latest = request_logs[0]
-            log_str = (
-                f"{latest.get('time', '')} "
-                f"{latest.get('method', '')} "
-                f"{latest.get('path', '')} "
-                f"[{latest.get('status', '')}]"
-            )
-            if log_str != self.last_log:
-                self.last_log = log_str
-                self.update_log(log_str)
+            for entry in reversed(list(request_logs)):
+                log_key = self._build_request_log_key(entry)
+                if log_key in self.seen_request_keys:
+                    continue
+                self.seen_request_keys.add(log_key)
+                level = self._status_to_level(entry.get("status", 0))
+                model = entry.get("effective_model") or entry.get("model", "")
+                latency = entry.get("latency_ms")
+                latency_text = f" {latency}ms" if isinstance(latency, (int, float)) else ""
+                msg = (
+                    f"{entry.get('time', '')} {entry.get('method', '')} {entry.get('path', '')} "
+                    f"[{entry.get('status', '')}] {model}{latency_text}"
+                ).strip()
+                self.update_log(msg, level=level)
 
-    def update_log(self, msg: str):
-        """更新日志（追加模式，保留历史）"""
-        current_text = self.log_text.toPlainText()
-        # 保留最近10条日志，避免文本过长
-        log_lines = current_text.split('\n')[-9:]
-        log_lines.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-        self.log_text.setText('\n'.join(log_lines))
-        # 滚动到最后一行
+            # 防止去重集合无限增长
+            if len(self.seen_request_keys) > 1000:
+                self.seen_request_keys = {self._build_request_log_key(item) for item in request_logs}
+
+    def _build_request_log_key(self, entry: Dict[str, object]) -> str:
+        request_id = str(entry.get("request_id", "") or "").strip()
+        if request_id:
+            return request_id
+        return (
+            f"{entry.get('time', '')}|{entry.get('method', '')}|{entry.get('path', '')}|"
+            f"{entry.get('status', '')}|{entry.get('model', '')}|{entry.get('latency_ms', '')}"
+        )
+
+    def _status_to_level(self, status: object) -> str:
+        try:
+            status_num = int(status)
+        except Exception:
+            return "info"
+        if status_num >= 500:
+            return "error"
+        if status_num >= 400:
+            return "warning"
+        return "success"
+
+    def update_log(self, msg: str, level: str = "info"):
+        """更新日志（最多保留 200 条，按级别着色）"""
+        level_colors = {
+            "info": "#ff9966",
+            "success": "#34d399",
+            "warning": "#f59e0b",
+            "error": "#ff6b6b",
+        }
+        level_key = level if level in level_colors else "info"
+        ts = datetime.now().strftime('%H:%M:%S')
+        self.log_entries.append((ts, msg, level_key))
+
+        html_lines = []
+        for line_ts, line_msg, line_level in self.log_entries:
+            color = level_colors.get(line_level, level_colors["info"])
+            html_lines.append(f"<span style='color:{color}'>[{line_ts}] {html.escape(str(line_msg))}</span>")
+
+        self.log_text.setHtml("<br>".join(html_lines))
         self.log_text.moveCursor(self.log_text.textCursor().End)
 
     @pyqtSlot()
@@ -873,8 +915,10 @@ class MainWindow(QMainWindow):
         stats['success'] = 0
         stats['error'] = 0
         self.update_stats()
-        self.log_text.setText("日志已清空 / Logs cleared")
-        self.last_log = ""
+        self.log_entries.clear()
+        self.seen_request_keys.clear()
+        self.log_text.clear()
+        self.update_log("日志已清空 / Logs cleared", level="info")
 
     @pyqtSlot()
     def start_oauth(self):

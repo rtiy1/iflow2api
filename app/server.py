@@ -3,9 +3,12 @@ import logging
 import asyncio
 import os
 import time
+import json
 import platform
 import psutil
 import sys
+import httpx
+from typing import Any, Dict
 from datetime import datetime
 from contextlib import asynccontextmanager
 from collections import deque
@@ -19,8 +22,8 @@ start_time = time.time()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 请求日志存储
-request_logs = deque(maxlen=100)
+# 请求日志存储（提高容量，减少高频请求下的日志丢失）
+request_logs = deque(maxlen=300)
 stats = {"total": 0, "success": 0, "error": 0}
 from converters import (
     anthropic_to_openai,
@@ -29,6 +32,89 @@ from converters import (
 )
 
 app = FastAPI()
+
+
+def _truncate_text(value: Any, limit: int = 4000) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...(truncated)"
+
+
+def _safe_json_dump(value: Any, limit: int = 4000) -> str:
+    try:
+        dumped = json.dumps(value, ensure_ascii=False)
+    except Exception:
+        dumped = str(value)
+    return _truncate_text(dumped, limit)
+
+
+def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    redacted = {}
+    sensitive_keys = {
+        "authorization",
+        "x-api-key",
+        "api-key",
+        "cookie",
+        "set-cookie",
+        "proxy-authorization",
+    }
+    for key, value in headers.items():
+        if key.lower() in sensitive_keys:
+            redacted[key] = "***"
+        else:
+            redacted[key] = _truncate_text(value, 500)
+    return redacted
+
+
+def _elapsed_ms(start_ts: float) -> int:
+    return max(0, int((time.perf_counter() - start_ts) * 1000))
+
+
+def _append_request_log(
+    *,
+    method: str,
+    path: str,
+    status: int,
+    model: str,
+    request_id: str,
+    latency_ms: int,
+    headers: Dict[str, str] | None = None,
+    body: str = "",
+    reasoning: str = "",
+    content: str = "",
+    error: str = "",
+    effective_model: str = "",
+    upstream_status: int | None = None,
+) -> None:
+    entry: Dict[str, Any] = {
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "method": method,
+        "path": path,
+        "status": status,
+        "model": model,
+        "request_id": request_id,
+        "latency_ms": latency_ms,
+    }
+
+    if headers:
+        entry["headers"] = headers
+    if body:
+        entry["body"] = _truncate_text(body, 4000)
+    if reasoning:
+        entry["reasoning"] = _truncate_text(reasoning, 3000)
+    if content:
+        entry["content"] = _truncate_text(content, 1000)
+    if error:
+        entry["error"] = _truncate_text(error, 2000)
+    if effective_model:
+        entry["effective_model"] = effective_model
+    if upstream_status is not None:
+        entry["upstream_status"] = upstream_status
+
+    request_logs.appendleft(entry)
 
 def make_openai_error(status: int, message: str, err_type: str = "api_error"):
     return JSONResponse({"error": {"message": message, "type": err_type, "code": status}}, status_code=status)
@@ -309,6 +395,21 @@ async def admin_page():
                         </div>`;
                 }
 
+                if (l.request_id || l.latency_ms !== undefined || l.effective_model || l.upstream_status !== undefined) {
+                    const meta = {
+                        request_id: l.request_id || '',
+                        latency_ms: l.latency_ms ?? '',
+                        effective_model: l.effective_model || l.model || '',
+                        upstream_status: l.upstream_status ?? ''
+                    };
+                    const content = JSON.stringify(meta, null, 2);
+                    detailsHtml += `
+                        <div class="detail-section">
+                            <div class="detail-title">Meta <button class="copy-btn" onclick="event.stopPropagation();copyToClipboard('${escapeJs(content)}')">Copy</button></div>
+                            <div class="code-block">${escapeHtml(content)}</div>
+                        </div>`;
+                }
+
                 if (l.reasoning) {
                      detailsHtml += `
                         <div class="detail-section">
@@ -325,6 +426,14 @@ async def admin_page():
                         </div>`;
                 }
 
+                if (l.error) {
+                    detailsHtml += `
+                        <div class="detail-section">
+                            <div class="detail-title" style="color:#ef4444">❌ Error</div>
+                            <div class="code-block" style="border-color: #ef444433;">${escapeHtml(l.error)}</div>
+                        </div>`;
+                }
+
                 return `
                 <div class="log-item">
                     <div class="log-header" onclick="toggle(${i})">
@@ -332,7 +441,7 @@ async def admin_page():
                         <span class="method">${l.method}</span>
                         <span class="path" title="${l.path}">${l.path}</span>
                         <span class="badge ${statusClass}">${l.status}</span>
-                        ${l.model ? `<span class="model-tag">${l.model}</span>` : '<span></span>'}
+                        ${(l.effective_model || l.model) ? `<span class="model-tag">${l.effective_model || l.model}${(l.latency_ms !== undefined && l.latency_ms !== null) ? ` · ${l.latency_ms}ms` : ''}</span>` : '<span></span>'}
                     </div>
                     <div class="log-detail" id="detail-${i}">
                         ${detailsHtml || '<div style="color:var(--text-muted)">无详细信息</div>'}
@@ -360,7 +469,8 @@ async def admin_page():
             const filtered = allLogs.filter(l => 
                 (l.model || '').toLowerCase().includes(q) || 
                 (l.path || '').toLowerCase().includes(q) ||
-                (l.method || '').toLowerCase().includes(q)
+                (l.method || '').toLowerCase().includes(q) ||
+                (l.request_id || '').toLowerCase().includes(q)
             );
             renderLogs(filtered);
         }
@@ -471,21 +581,64 @@ async def models(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    request_id = f"req_{uuid.uuid4().hex[:12]}"
+    request_started = time.perf_counter()
+    headers_for_log = _sanitize_headers(dict(request.headers))
+    body_for_log = ""
+
     try:
         body_bytes = await request.body()
-        import json
         body = json.loads(body_bytes.decode("utf-8"))
     except json.JSONDecodeError as e:
+        stats["total"] += 1
+        stats["error"] += 1
+        _append_request_log(
+            method="POST",
+            path="/v1/chat/completions",
+            status=400,
+            model="unknown",
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            error=f"Invalid JSON: {e}",
+        )
         return make_openai_error(400, f"Invalid JSON: {e}", "invalid_request_error")
-    except Exception as e:
+    except Exception:
+        stats["total"] += 1
+        stats["error"] += 1
+        _append_request_log(
+            method="POST",
+            path="/v1/chat/completions",
+            status=400,
+            model="unknown",
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            error="Invalid JSON",
+        )
         return make_openai_error(400, "Invalid JSON", "invalid_request_error")
 
     model = body.get("model", "unknown")
+    body_for_log = _safe_json_dump(body)
     body["max_tokens"] = max(body.get("max_tokens", 4096), 1024)
 
     # 验证消息数组
     messages = body.get("messages", [])
     if not messages or not isinstance(messages, list):
+        stats["total"] += 1
+        stats["error"] += 1
+        _append_request_log(
+            method="POST",
+            path="/v1/chat/completions",
+            status=400,
+            model=model,
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            body=body_for_log,
+            error="messages array is required and must be non-empty",
+            effective_model=model,
+        )
         return make_openai_error(400, "messages array is required and must be non-empty", "invalid_request_error")
 
     logger.info(f"Request model={model}, thinking={body.get('thinking')}, has_tools={bool(body.get('tools'))}")
@@ -495,68 +648,113 @@ async def chat_completions(request: Request):
 
         if body.get("stream"):
             body["stream_options"] = {"include_usage": True}
-            import json as _json
             reasoning_parts = []
             content_parts = []
 
             async def stream():
-                MAX_CONTINUATIONS = 5
-                continuation_count = 0
-                current_body = body.copy()
-                accumulated_content = ""
-                accumulated_reasoning = ""
+                try:
+                    MAX_CONTINUATIONS = 5
+                    continuation_count = 0
+                    current_body = body.copy()
+                    accumulated_content = ""
+                    accumulated_reasoning = ""
 
-                while continuation_count <= MAX_CONTINUATIONS:
-                    last_finish_reason = None
+                    while continuation_count <= MAX_CONTINUATIONS:
+                        last_finish_reason = None
 
-                    async for chunk in await proxy.proxy_request("/chat/completions", current_body, model, stream=True):
-                        line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
-                        if line and line.startswith("data: ") and not line.endswith("[DONE]"):
-                            try:
-                                data = _json.loads(line[6:])
-                                choice = data.get("choices", [{}])[0]
-                                delta = choice.get("delta", {})
-                                last_finish_reason = choice.get("finish_reason")
+                        async for chunk in await proxy.proxy_request("/chat/completions", current_body, model, stream=True):
+                            line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                            if line and line.startswith("data: ") and not line.endswith("[DONE]"):
+                                try:
+                                    data = json.loads(line[6:])
+                                    choice = data.get("choices", [{}])[0]
+                                    delta = choice.get("delta", {})
+                                    last_finish_reason = choice.get("finish_reason")
 
-                                if delta.get("reasoning_content"):
-                                    reasoning_parts.append(delta["reasoning_content"])
-                                    accumulated_reasoning += delta["reasoning_content"]
-                                    logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
-                                if delta.get("content"):
-                                    content_parts.append(delta["content"])
-                                    accumulated_content += delta["content"]
-                            except Exception as e:
-                                logger.warning(f"Parse chunk error: {e}")
+                                    if delta.get("reasoning_content"):
+                                        reasoning_parts.append(delta["reasoning_content"])
+                                        accumulated_reasoning += delta["reasoning_content"]
+                                        logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
+                                    if delta.get("content"):
+                                        content_parts.append(delta["content"])
+                                        accumulated_content += delta["content"]
+                                except Exception as e:
+                                    logger.warning(f"Parse chunk error: {e}")
 
-                        # 不发送 [DONE]，由续写逻辑控制
-                        if line and "[DONE]" not in line:
-                            yield line if line.endswith("\n\n") else line + "\n\n"
+                            # 不发送 [DONE]，由续写逻辑控制
+                            if line and "[DONE]" not in line:
+                                yield line if line.endswith("\n\n") else line + "\n\n"
 
-                    # 检查是否需要续写
-                    if last_finish_reason != "length":
-                        break
+                        # 检查是否需要续写
+                        if last_finish_reason != "length":
+                            break
 
-                    continuation_count += 1
-                    if continuation_count > MAX_CONTINUATIONS:
-                        break
+                        continuation_count += 1
+                        if continuation_count > MAX_CONTINUATIONS:
+                            break
 
-                    logger.info(f"流式输出被截断，自动续写 ({continuation_count}/{MAX_CONTINUATIONS})")
+                        logger.info(f"流式输出被截断，自动续写 ({continuation_count}/{MAX_CONTINUATIONS})")
 
-                    # 追加已生成的内容，继续请求
-                    assistant_msg = {"role": "assistant", "content": accumulated_content}
-                    if accumulated_reasoning:
-                        assistant_msg["reasoning_content"] = accumulated_reasoning
-                    current_body["messages"] = current_body.get("messages", []) + [assistant_msg]
+                        # 追加已生成的内容，继续请求
+                        assistant_msg = {"role": "assistant", "content": accumulated_content}
+                        if accumulated_reasoning:
+                            assistant_msg["reasoning_content"] = accumulated_reasoning
+                        current_body["messages"] = current_body.get("messages", []) + [assistant_msg]
 
-                # 发送最终的 [DONE]
-                yield "data: [DONE]\n\n"
+                    # 发送最终的 [DONE]
+                    yield "data: [DONE]\n\n"
 
-                request_logs.appendleft({
-                    "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/chat/completions",
-                    "status": 200, "model": model, "reasoning": "".join(reasoning_parts)[:3000], "content": "".join(content_parts)[:1000]
-                })
-                stats["total"] += 1
-                stats["success"] += 1
+                    stats["total"] += 1
+                    stats["success"] += 1
+                    _append_request_log(
+                        method="POST",
+                        path="/v1/chat/completions",
+                        status=200,
+                        model=model,
+                        request_id=request_id,
+                        latency_ms=_elapsed_ms(request_started),
+                        headers=headers_for_log,
+                        body=body_for_log,
+                        reasoning="".join(reasoning_parts),
+                        content="".join(content_parts),
+                        effective_model=model,
+                    )
+                except httpx.HTTPStatusError as e:
+                    stats["total"] += 1
+                    stats["error"] += 1
+                    upstream_status = e.response.status_code
+                    _append_request_log(
+                        method="POST",
+                        path="/v1/chat/completions",
+                        status=502,
+                        model=model,
+                        request_id=request_id,
+                        latency_ms=_elapsed_ms(request_started),
+                        headers=headers_for_log,
+                        body=body_for_log,
+                        error=f"Upstream API error: HTTP {upstream_status}",
+                        effective_model=model,
+                        upstream_status=upstream_status,
+                    )
+                    logger.error(f"上游 API 返回错误 HTTP {upstream_status} for model={model}: {e}")
+                    raise
+                except Exception as e:
+                    stats["total"] += 1
+                    stats["error"] += 1
+                    _append_request_log(
+                        method="POST",
+                        path="/v1/chat/completions",
+                        status=500,
+                        model=model,
+                        request_id=request_id,
+                        latency_ms=_elapsed_ms(request_started),
+                        headers=headers_for_log,
+                        body=body_for_log,
+                        error=f"{type(e).__name__}: {e}",
+                        effective_model=model,
+                    )
+                    logger.error(f"请求处理失败 for model={model}: {type(e).__name__}: {e}")
+                    raise
 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -610,22 +808,56 @@ async def chat_completions(request: Request):
 
         reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        request_logs.appendleft({
-            "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/chat/completions",
-            "status": 200, "model": model, "reasoning": reasoning[:3000], "content": content[:1000]
-        })
         stats["total"] += 1
         stats["success"] += 1
+        _append_request_log(
+            method="POST",
+            path="/v1/chat/completions",
+            status=200,
+            model=model,
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            body=body_for_log,
+            reasoning=reasoning,
+            content=content,
+            effective_model=model,
+        )
         return data
     except httpx.HTTPStatusError as e:
         stats["total"] += 1
         stats["error"] += 1
         status_code = e.response.status_code
+        _append_request_log(
+            method="POST",
+            path="/v1/chat/completions",
+            status=502,
+            model=model,
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            body=body_for_log,
+            error=f"Upstream API error: HTTP {status_code}",
+            effective_model=model,
+            upstream_status=status_code,
+        )
         logger.error(f"上游 API 返回错误 HTTP {status_code} for model={model}: {e}")
         return make_openai_error(502, f"Upstream API error: HTTP {status_code}", "upstream_error")
     except Exception as e:
         stats["total"] += 1
         stats["error"] += 1
+        _append_request_log(
+            method="POST",
+            path="/v1/chat/completions",
+            status=500,
+            model=model,
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            body=body_for_log,
+            error=f"{type(e).__name__}: {e}",
+            effective_model=model,
+        )
         logger.error(f"请求处理失败 for model={model}: {type(e).__name__}: {e}")
         return make_openai_error(500, str(e), "internal_error")
 
@@ -657,18 +889,47 @@ async def count_tokens(request: Request):
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
+    request_id = f"req_{uuid.uuid4().hex[:12]}"
+    request_started = time.perf_counter()
+    headers_for_log = _sanitize_headers(dict(request.headers))
+    body_for_log = ""
+
     try:
         body_bytes = await request.body()
-        import json
         body = json.loads(body_bytes.decode("utf-8"))
     except json.JSONDecodeError as e:
+        stats["total"] += 1
+        stats["error"] += 1
+        _append_request_log(
+            method="POST",
+            path="/v1/messages",
+            status=400,
+            model="unknown",
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            error=f"Invalid JSON: {e}",
+        )
         return make_anthropic_error(400, f"Invalid JSON: {e}", "invalid_request_error")
-    except Exception as e:
+    except Exception:
+        stats["total"] += 1
+        stats["error"] += 1
+        _append_request_log(
+            method="POST",
+            path="/v1/messages",
+            status=400,
+            model="unknown",
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            error="Invalid JSON",
+        )
         return make_anthropic_error(400, "Invalid JSON", "invalid_request_error")
 
     openai_req = anthropic_to_openai(body)
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     model = body.get("model", "")
+    body_for_log = _safe_json_dump(body)
     openai_req["max_tokens"] = max(openai_req.get("max_tokens", 4096), 1024)
 
     logger.info(f"Request model={model}, thinking={openai_req.get('thinking')}, has_tools={bool(openai_req.get('tools'))}")
@@ -678,34 +939,78 @@ async def anthropic_messages(request: Request):
 
         if body.get("stream"):
             openai_req["stream_options"] = {"include_usage": True}
-            import json as _json
             reasoning_parts = []
             content_parts = []
 
             async def stream():
-                converter = StreamConverter(model, msg_id)
-                async for chunk in await proxy.proxy_request("/chat/completions", openai_req, model, stream=True):
-                    line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
-                    if line and line.startswith("data: ") and not line.endswith("[DONE]"):
-                        try:
-                            data = _json.loads(line[6:])
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            if delta.get("reasoning_content"):
-                                reasoning_parts.append(delta["reasoning_content"])
-                                logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
-                            if delta.get("content"):
-                                content_parts.append(delta["content"])
-                        except Exception as e:
-                            logger.warning(f"Parse chunk error: {e}")
-                    if line:
-                        for event in converter.convert_chunk(line):
-                            yield event
-                request_logs.appendleft({
-                    "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/messages",
-                    "status": 200, "model": model, "reasoning": "".join(reasoning_parts)[:3000], "content": "".join(content_parts)[:1000]
-                })
-                stats["total"] += 1
-                stats["success"] += 1
+                try:
+                    converter = StreamConverter(model, msg_id)
+                    async for chunk in await proxy.proxy_request("/chat/completions", openai_req, model, stream=True):
+                        line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                        if line and line.startswith("data: ") and not line.endswith("[DONE]"):
+                            try:
+                                data = json.loads(line[6:])
+                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                if delta.get("reasoning_content"):
+                                    reasoning_parts.append(delta["reasoning_content"])
+                                    logger.info(f"[Thinking] {delta['reasoning_content'][:100]}")
+                                if delta.get("content"):
+                                    content_parts.append(delta["content"])
+                            except Exception as e:
+                                logger.warning(f"Parse chunk error: {e}")
+                        if line:
+                            for event in converter.convert_chunk(line):
+                                yield event
+                    stats["total"] += 1
+                    stats["success"] += 1
+                    _append_request_log(
+                        method="POST",
+                        path="/v1/messages",
+                        status=200,
+                        model=model,
+                        request_id=request_id,
+                        latency_ms=_elapsed_ms(request_started),
+                        headers=headers_for_log,
+                        body=body_for_log,
+                        reasoning="".join(reasoning_parts),
+                        content="".join(content_parts),
+                        effective_model=model,
+                    )
+                except httpx.HTTPStatusError as e:
+                    stats["total"] += 1
+                    stats["error"] += 1
+                    upstream_status = e.response.status_code
+                    _append_request_log(
+                        method="POST",
+                        path="/v1/messages",
+                        status=502,
+                        model=model,
+                        request_id=request_id,
+                        latency_ms=_elapsed_ms(request_started),
+                        headers=headers_for_log,
+                        body=body_for_log,
+                        error=f"Upstream API error: HTTP {upstream_status}",
+                        effective_model=model,
+                        upstream_status=upstream_status,
+                    )
+                    logger.error(f"上游 API 返回错误 HTTP {upstream_status} for model={model}: {e}")
+                    raise
+                except Exception as e:
+                    stats["total"] += 1
+                    stats["error"] += 1
+                    _append_request_log(
+                        method="POST",
+                        path="/v1/messages",
+                        status=500,
+                        model=model,
+                        request_id=request_id,
+                        latency_ms=_elapsed_ms(request_started),
+                        headers=headers_for_log,
+                        body=body_for_log,
+                        error=f"{type(e).__name__}: {e}",
+                        effective_model=model,
+                    )
+                    raise
 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -713,16 +1018,56 @@ async def anthropic_messages(request: Request):
         logger.info(f"Non-stream response usage: {data.get('usage')}")
         reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        request_logs.appendleft({
-            "time": datetime.now().strftime("%H:%M:%S"), "method": "POST", "path": "/v1/messages",
-            "status": 200, "model": model, "reasoning": reasoning[:3000], "content": content[:1000]
-        })
         stats["total"] += 1
         stats["success"] += 1
+        _append_request_log(
+            method="POST",
+            path="/v1/messages",
+            status=200,
+            model=model,
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            body=body_for_log,
+            reasoning=reasoning,
+            content=content,
+            effective_model=model,
+        )
         return JSONResponse(openai_to_anthropic_nonstream(data))
+    except httpx.HTTPStatusError as e:
+        stats["total"] += 1
+        stats["error"] += 1
+        status_code = e.response.status_code
+        _append_request_log(
+            method="POST",
+            path="/v1/messages",
+            status=502,
+            model=model,
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            body=body_for_log,
+            error=f"Upstream API error: HTTP {status_code}",
+            effective_model=model,
+            upstream_status=status_code,
+        )
+        logger.error(f"上游 API 返回错误 HTTP {status_code} for model={model}: {e}")
+        return make_anthropic_error(502, f"Upstream API error: HTTP {status_code}", "upstream_error")
     except Exception as e:
         stats["total"] += 1
         stats["error"] += 1
+        _append_request_log(
+            method="POST",
+            path="/v1/messages",
+            status=500,
+            model=model,
+            request_id=request_id,
+            latency_ms=_elapsed_ms(request_started),
+            headers=headers_for_log,
+            body=body_for_log,
+            error=f"{type(e).__name__}: {e}",
+            effective_model=model,
+        )
         return make_anthropic_error(500, str(e), "internal_error")
 
 def run_server():

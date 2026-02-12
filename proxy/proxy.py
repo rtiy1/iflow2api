@@ -33,10 +33,8 @@ KNOWN_MULTIMODAL_MODELS = {
     "qwen3-vl-plus",
     "tstars2.0",
 }
-FORCE_VISION_MODEL_SERIES_PREFIXES = (
-    "glm",
-    "minimax",
-)
+# 对 GLM / MiniMax 系列启用两段式视觉处理
+FORCE_VISION_MODEL_SERIES_PREFIXES = ("glm", "minimax")
 EXTRA_MODELS = [
     "glm-4.7",
     "glm-5",
