@@ -39,6 +39,7 @@ FORCE_VISION_MODEL_SERIES_PREFIXES = (
 )
 EXTRA_MODELS = [
     "glm-4.7",
+    "glm-5",
     "minimax-m2.1",
     "kimi-k2.5",
     "iflow-rome-30ba3b",

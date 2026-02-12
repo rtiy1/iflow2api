@@ -34,6 +34,7 @@ iFlow 的 Python 反向代理，提供 OpenAI/Anthropic 兼容接口，包含 GU
 `/v1/models` 会先返回上游结果，并补充本地可用但上游列表可能不返回的模型：
 
 - `glm-4.7`
+- `glm-5`
 - `minimax-m2.1`
 - `kimi-k2.5`
 

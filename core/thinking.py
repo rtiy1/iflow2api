@@ -229,7 +229,11 @@ def preserve_reasoning_content(body: Dict[str, Any], model: str) -> Dict[str, An
     model_lower = model.lower()
 
     # Only apply to models that support thinking with history preservation
-    needs_preservation = model_lower.startswith("glm-4") or model_lower.startswith("minimax-m2")
+    needs_preservation = (
+        model_lower.startswith("glm-4")
+        or model_lower.startswith("glm-5")
+        or model_lower.startswith("minimax-m2")
+    )
 
     if not needs_preservation:
         return body
