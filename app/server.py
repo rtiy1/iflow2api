@@ -137,98 +137,254 @@ async def admin_page():
     <title>iFlow2API 控制台</title>
     <style>
         :root {
-            --bg-body: #0f172a;
-            --bg-card: #1e293b;
-            --bg-hover: #334155;
-            --text-main: #f1f5f9;
-            --text-muted: #94a3b8;
-            --primary: #3b82f6;
-            --primary-hover: #2563eb;
-            --danger: #ef4444;
-            --success: #22c55e;
-            --warning: #f59e0b;
-            --border: #334155;
+            --bg-body: #060913;
+            --bg-panel: #0f1425;
+            --bg-card: #141b31;
+            --bg-hover: #1d2644;
+            --text-main: #e7edf9;
+            --text-muted: #97a7c6;
+            --accent: #36d0a8;
+            --accent-2: #5b8cff;
+            --danger: #ff6b81;
+            --success: #2fd18f;
+            --warning: #f3b24f;
+            --border: #2a3558;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background: var(--bg-body); color: var(--text-main); line-height: 1.5; font-size: 14px; }
-        
-        /* Layout */
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
-        h1 { font-size: 1.5rem; font-weight: 700; background: linear-gradient(to right, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        
-        /* Stats Grid */
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
-        .card { background: var(--bg-card); border-radius: 12px; padding: 20px; border: 1px solid var(--border); box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); transition: transform 0.2s; }
-        .card:hover { transform: translateY(-2px); }
-        .stat-label { color: var(--text-muted); font-size: 0.875rem; margin-bottom: 8px; }
-        .stat-value { font-size: 1.875rem; font-weight: 700; color: var(--text-main); }
+        body {
+            font-family: "Microsoft YaHei UI", "PingFang SC", "Source Han Sans SC", sans-serif;
+            color: var(--text-main);
+            line-height: 1.55;
+            font-size: 14px;
+            background:
+                radial-gradient(1200px 500px at 20% -10%, rgba(54, 208, 168, 0.12), transparent 60%),
+                radial-gradient(900px 400px at 90% 0%, rgba(91, 140, 255, 0.16), transparent 55%),
+                var(--bg-body);
+        }
+
+        .container { max-width: 1220px; margin: 0 auto; padding: 20px; }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 22px;
+            padding: 16px 18px;
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            background: linear-gradient(135deg, rgba(15, 20, 37, 0.95), rgba(20, 27, 49, 0.88));
+            backdrop-filter: blur(3px);
+        }
+        h1 {
+            font-family: "Bahnschrift", "Microsoft YaHei UI", sans-serif;
+            font-size: 1.5rem;
+            letter-spacing: 0.02em;
+            font-weight: 700;
+            color: #d8f4ff;
+        }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-bottom: 20px; }
+        .card {
+            background: linear-gradient(170deg, rgba(20, 27, 49, 0.95), rgba(15, 20, 37, 0.92));
+            border-radius: 12px;
+            padding: 18px;
+            border: 1px solid var(--border);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+            transition: transform 0.16s ease, border-color 0.16s ease;
+        }
+        .card:hover { transform: translateY(-1px); border-color: #3b4c79; }
+        .stat-label {
+            color: var(--text-muted);
+            font-size: 0.82rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+        .stat-value { font-size: 1.85rem; font-weight: 700; color: var(--text-main); }
         .stat-value.success { color: var(--success); }
         .stat-value.error { color: var(--danger); }
-        
-        /* Models Section */
-        .models-container { margin-bottom: 24px; }
-        .section-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+
+        .models-container { margin-bottom: 20px; }
+        .section-title {
+            font-family: "Bahnschrift", "Microsoft YaHei UI", sans-serif;
+            font-size: 1.04rem;
+            font-weight: 700;
+            margin-bottom: 10px;
+            color: #d6e3ff;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            letter-spacing: 0.02em;
+        }
         .chip-container { display: flex; flex-wrap: wrap; gap: 8px; }
-        .chip { background: var(--bg-hover); padding: 6px 12px; border-radius: 9999px; font-size: 0.85rem; color: var(--text-main); border: 1px solid var(--border); }
+        .chip {
+            background: linear-gradient(145deg, #1a2340, #151d34);
+            padding: 6px 11px;
+            border-radius: 999px;
+            font-size: 0.82rem;
+            color: #d7e2fa;
+            border: 1px solid #2f3d68;
+        }
 
-        /* System Info */
-        .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
-        .info-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: var(--bg-hover); border-radius: 8px; }
-        .info-label { color: var(--text-muted); font-size: 0.9rem; }
-        .info-value { color: var(--text-main); font-weight: 600; font-family: monospace; }
+        .usage-section { margin-top: 20px; }
+        .example-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+        .example-title {
+            font-size: 0.98rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+            color: #83afff;
+        }
+        .example-code {
+            background: #0a1020;
+            padding: 12px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-family: "JetBrains Mono", "Cascadia Code", "Consolas", monospace;
+            font-size: 0.82rem;
+            color: #dfe9ff;
+            border: 1px solid #263259;
+            line-height: 1.48;
+        }
 
-        /* Usage Examples */
-        .usage-section { margin-top: 24px; }
-        .example-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-        .example-title { font-size: 1rem; font-weight: 600; margin-bottom: 8px; color: var(--primary); }
-        .example-code { background: #0b1120; padding: 12px; border-radius: 6px; overflow-x: auto; font-family: monospace; font-size: 0.85rem; color: #e2e8f0; border: 1px solid var(--border); }
-        
-        /* Logs Toolbar */
-        .toolbar { display: flex; gap: 12px; margin-bottom: 16px; align-items: center; }
-        input[type="text"] { background: var(--bg-card); border: 1px solid var(--border); color: var(--text-main); padding: 8px 12px; border-radius: 6px; width: 300px; outline: none; transition: border-color 0.2s; }
-        input[type="text"]:focus { border-color: var(--primary); }
-        .btn { padding: 8px 16px; border-radius: 6px; border: none; font-weight: 500; cursor: pointer; transition: background 0.2s; font-size: 0.875rem; }
-        .btn-primary { background: var(--primary); color: white; }
-        .btn-primary:hover { background: var(--primary-hover); }
-        .btn-danger { background: rgba(239, 68, 68, 0.1); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.2); }
-        .btn-danger:hover { background: rgba(239, 68, 68, 0.2); }
-        .btn-icon { padding: 8px; background: transparent; color: var(--text-muted); }
-        .btn-icon:hover { color: var(--text-main); background: var(--bg-hover); }
+        .toolbar {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 0;
+        }
+        input[type="text"] {
+            background: #0f1630;
+            border: 1px solid #2f3d69;
+            color: var(--text-main);
+            padding: 9px 12px;
+            border-radius: 8px;
+            width: 320px;
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        input[type="text"]:focus {
+            border-color: var(--accent-2);
+            box-shadow: 0 0 0 3px rgba(91, 140, 255, 0.17);
+        }
+        .btn {
+            padding: 8px 14px;
+            border-radius: 8px;
+            border: 1px solid transparent;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-size: 0.82rem;
+            letter-spacing: 0.01em;
+        }
+        .btn-primary {
+            background: linear-gradient(145deg, #3a8cff, #3f77ff);
+            color: #f7fbff;
+            border-color: #4f81ff;
+        }
+        .btn-primary:hover { filter: brightness(1.06); }
+        .btn-danger {
+            background: rgba(255, 107, 129, 0.12);
+            color: #ff8ea0;
+            border-color: rgba(255, 107, 129, 0.35);
+        }
+        .btn-danger:hover { background: rgba(255, 107, 129, 0.2); }
 
-        /* Logs List */
-        .logs-wrapper { background: var(--bg-card); border-radius: 12px; border: 1px solid var(--border); overflow: hidden; }
-        .log-item { border-bottom: 1px solid var(--border); transition: background 0.15s; }
+        .logs-wrapper {
+            background: rgba(15, 20, 37, 0.9);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            overflow: hidden;
+            box-shadow: 0 14px 36px rgba(0, 0, 0, 0.22);
+        }
+        .log-item { border-bottom: 1px solid #263259; transition: background 0.15s; }
         .log-item:last-child { border-bottom: none; }
-        .log-header { padding: 12px 16px; display: grid; grid-template-columns: 80px 80px 1fr 80px 150px; align-items: center; gap: 12px; cursor: pointer; }
-        .log-header:hover { background: var(--bg-hover); }
-        
-        .badge { padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-align: center; }
-        .badge-2xx { background: rgba(34, 197, 94, 0.15); color: var(--success); }
-        .badge-4xx { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
-        .badge-5xx { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
-        
-        .method { font-family: monospace; font-weight: 700; color: var(--text-muted); }
-        .path { font-family: monospace; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .time { color: var(--text-muted); font-size: 0.85rem; }
-        .model-tag { font-size: 0.8rem; color: var(--primary); background: rgba(59, 130, 246, 0.1); padding: 2px 6px; border-radius: 4px; justify-self: start;}
+        .log-header {
+            padding: 12px 14px;
+            display: grid;
+            grid-template-columns: 84px 72px 1fr 86px 180px;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+        }
+        .log-header:hover { background: rgba(44, 61, 104, 0.25); }
 
-        /* Log Detail */
-        .log-detail { display: none; padding: 16px; background: #0b1120; border-top: 1px solid var(--border); font-family: 'Fira Code', monospace; font-size: 0.85rem; }
+        .badge { padding: 2px 8px; border-radius: 6px; font-size: 0.74rem; font-weight: 700; text-align: center; }
+        .badge-2xx { background: rgba(47, 209, 143, 0.18); color: var(--success); }
+        .badge-4xx { background: rgba(243, 178, 79, 0.18); color: var(--warning); }
+        .badge-5xx { background: rgba(255, 107, 129, 0.2); color: var(--danger); }
+
+        .method,
+        .path,
+        .model-tag,
+        .time {
+            font-family: "JetBrains Mono", "Cascadia Code", "Consolas", monospace;
+        }
+        .method { font-weight: 700; color: #89a1d6; }
+        .path { color: #e4ecff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .time { color: var(--text-muted); font-size: 0.83rem; }
+        .model-tag {
+            font-size: 0.78rem;
+            color: #8ad9ff;
+            background: rgba(91, 140, 255, 0.15);
+            padding: 2px 6px;
+            border-radius: 6px;
+            justify-self: start;
+        }
+
+        .log-detail {
+            display: none;
+            padding: 14px;
+            background: #0a1020;
+            border-top: 1px solid #243055;
+            font-family: "JetBrains Mono", "Cascadia Code", "Consolas", monospace;
+            font-size: 0.82rem;
+        }
         .log-detail.active { display: block; }
-        .detail-section { margin-bottom: 16px; }
-        .detail-title { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; display: flex; justify-content: space-between; }
-        .code-block { background: #1e293b; padding: 12px; border-radius: 6px; overflow-x: auto; color: #e2e8f0; white-space: pre-wrap; word-break: break-all; border: 1px solid #334155; }
-        .copy-btn { font-size: 0.7rem; background: transparent; border: 1px solid var(--border); color: var(--text-muted); padding: 2px 6px; border-radius: 4px; cursor: pointer; }
-        .copy-btn:hover { color: var(--text-main); border-color: var(--text-muted); }
-        
-        .empty-state { padding: 40px; text-align: center; color: var(--text-muted); }
-        
-        /* Scrollbar */
+        .detail-section { margin-bottom: 14px; }
+        .detail-title {
+            color: #8da0c5;
+            font-size: 0.74rem;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            margin-bottom: 7px;
+            display: flex;
+            justify-content: space-between;
+        }
+        .code-block {
+            background: #111a31;
+            padding: 11px;
+            border-radius: 8px;
+            overflow-x: auto;
+            color: #d9e6ff;
+            white-space: pre-wrap;
+            word-break: break-all;
+            border: 1px solid #26345c;
+        }
+        .copy-btn {
+            font-size: 0.68rem;
+            background: transparent;
+            border: 1px solid #41527d;
+            color: #9fb4da;
+            padding: 2px 6px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .copy-btn:hover { color: #eff5ff; border-color: #8ea9da; }
+        .empty-state { padding: 34px; text-align: center; color: var(--text-muted); }
+
+        @media (max-width: 900px) {
+            .container { padding: 12px; }
+            .log-header {
+                grid-template-columns: 74px 62px 1fr 70px;
+            }
+            .model-tag { grid-column: 1 / -1; margin-top: 4px; }
+            input[type="text"] { width: 100%; }
+        }
+
         ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: var(--bg-body); }
-        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+        ::-webkit-scrollbar-track { background: #0c1225; }
+        ::-webkit-scrollbar-thumb { background: #2d3b63; border-radius: 6px; }
+        ::-webkit-scrollbar-thumb:hover { background: #3b4f86; }
     </style>
 </head>
 <body>
@@ -264,20 +420,6 @@ async def admin_page():
             <div class="section-title">📦 可用模型</div>
             <div class="card">
                 <div id="models" class="chip-container">加载中...</div>
-            </div>
-        </div>
-
-        <div class="models-container">
-            <div class="section-title">⚙️ 系统信息</div>
-            <div class="card">
-                <div class="info-grid" id="sysinfo">
-                    <div class="info-item"><span class="info-label">Python版本</span><span class="info-value" id="pyVersion">--</span></div>
-                    <div class="info-item"><span class="info-label">平台</span><span class="info-value" id="platform">--</span></div>
-                    <div class="info-item"><span class="info-label">CPU使用</span><span class="info-value" id="cpu">--</span></div>
-                    <div class="info-item"><span class="info-label">内存使用</span><span class="info-value" id="memory">--</span></div>
-                    <div class="info-item"><span class="info-label">运行时间</span><span class="info-value" id="uptime">--</span></div>
-                    <div class="info-item"><span class="info-label">进程PID</span><span class="info-value" id="pid">--</span></div>
-                </div>
             </div>
         </div>
 
@@ -336,7 +478,6 @@ async def admin_page():
 
     <script>
         let allLogs = [];
-        let isAutoRefresh = true;
 
         function toggle(index) {
             const detail = document.getElementById(`detail-${index}`);
@@ -475,25 +616,35 @@ async def admin_page():
             renderLogs(filtered);
         }
 
-        async function refresh() {
+        async function refreshStats() {
             try {
                 const s = await (await fetch('/admin/stats')).json();
                 document.getElementById('total').textContent = s.total;
                 document.getElementById('success').textContent = s.success;
                 document.getElementById('error').textContent = s.error;
                 document.getElementById('rate').textContent = s.total > 0 ? Math.round(s.success / s.total * 100) + '%' : '-';
-                
-                allLogs = await (await fetch('/admin/logs')).json();
-                filterLogs();
             } catch (e) {
                 console.error("Failed to refresh stats", e);
             }
         }
 
+        async function refreshLogs() {
+            try {
+                allLogs = await (await fetch('/admin/logs')).json();
+                filterLogs();
+            } catch (e) {
+                console.error("Failed to refresh logs", e);
+            }
+        }
+
+        async function refresh() {
+            await Promise.all([refreshStats(), refreshLogs()]);
+        }
+
         async function clearLogs() {
             if (confirm('确定清空所有日志?')) {
                 await fetch('/admin/logs', { method: 'DELETE' });
-                refresh();
+                await Promise.all([refreshStats(), refreshLogs()]);
             }
         }
 
@@ -515,26 +666,11 @@ async def admin_page():
             }
         }
 
-        async function loadSystemInfo() {
-            try {
-                const info = await (await fetch('/admin/sysinfo')).json();
-                document.getElementById('pyVersion').textContent = info.python_version;
-                document.getElementById('platform').textContent = info.platform;
-                document.getElementById('cpu').textContent = info.cpu_percent + '%';
-                document.getElementById('memory').textContent = info.memory_percent + '%';
-                document.getElementById('uptime').textContent = info.uptime;
-                document.getElementById('pid').textContent = info.pid;
-            } catch (e) {
-                console.error("Load system info failed:", e);
-            }
-        }
-
         // Init
         refresh();
         loadModels();
-        loadSystemInfo();
-        setInterval(refresh, 3000);
-        setInterval(loadSystemInfo, 5000);
+        // 仅自动刷新统计，不自动刷新日志，避免展开详情被打断
+        setInterval(refreshStats, 3000);
     </script>
 </body>
 </html>"""
