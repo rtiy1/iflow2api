@@ -32,7 +32,7 @@ start_time = time.time()
 # 常量定义（统一管理，便于维护）
 # ==============================
 APP_TITLE = "iFlow2API Console"
-WINDOW_SIZE = (380, 320)  # 第二轮等比例缩小，适配“内层”尺寸
+WINDOW_SIZE = (540, 470)  # 大号窗口，提升可读性
 REFRESH_INTERVAL = 500  # 定时器刷新间隔(ms)
 PORT_MIN = 1024
 PORT_MAX = 65535
@@ -95,13 +95,13 @@ class Styles:
     /* Stats Labels */
     QLabel.StatLabel {
         color: #888888;
-        font-size: 9px;
+        font-size: 12px;
         font-weight: normal;
     }
 
     QLabel.StatValue {
         color: #ff9966;
-        font-size: 10px;
+        font-size: 13px;
         font-weight: bold;
     }
 
@@ -128,7 +128,7 @@ class Styles:
         padding: 2px 8px;
         font-family: 'Microsoft YaHei', sans-serif;
         font-weight: bold;
-        font-size: 8px;
+        font-size: 12px;
     }
 
     QPushButton:hover {
@@ -143,7 +143,7 @@ class Styles:
     }
 
     QPushButton.ActionBtn {
-        height: 18px;
+        height: 24px;
     }
 
     QPushButton:disabled {
@@ -155,7 +155,7 @@ class Styles:
     /* Checkbox */
     QCheckBox {
         color: #bbbbbb;
-        font-size: 9px;
+        font-size: 12px;
     }
     QCheckBox::indicator {
         width: 10px;
@@ -177,13 +177,33 @@ class Styles:
         border: 1px solid #ff5500;
         border-radius: 3px;
         padding: 1px 3px;
-        font-size: 9px;
+        font-size: 12px;
     }
 
     QLineEdit:disabled {
         background: #222222;
         border-color: #663300;
         color: #999999;
+    }
+
+    /* Dialog */
+    QDialog {
+        background-color: #050505;
+        color: #ff9966;
+        border: 1px solid #ff5500;
+        border-radius: 10px;
+    }
+
+    QTextEdit#DialogText {
+        background-color: #0a0a0a;
+        color: #ff9966;
+        border: 1px solid #ff5500;
+        border-radius: 6px;
+        padding: 12px;
+        font-family: 'Consolas', 'Microsoft YaHei', monospace;
+        font-size: 14px;
+        selection-background-color: #ff7733;
+        selection-color: #111111;
     }
 
     /* Log Area */
@@ -195,7 +215,7 @@ class Styles:
     QTextEdit.LogText {
         background-color: #000000;
         color: #ff9966;
-        font-size: 9px;
+        font-size: 12px;
         border: none;
         padding: 2px;
         font-family: 'Consolas', monospace;
@@ -251,10 +271,10 @@ class DoubleStrokeLabel(QWidget):
     def __init__(self, text: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.text = text
-        self.setFixedSize(180, 75) # 适配内层尺寸
+        self.setFixedSize(230, 96) # 放大 LOGO 区域
         
         # 缓存字体和颜色，避免重复创建
-        self.font = QFont("Courier New", 26, QFont.Bold) # 减小字号适配 compact 布局
+        self.font = QFont("Courier New", 32, QFont.Bold) # 放大 LOGO 字号
         self.stroke_color = QColor(0x70, 0x30, 0x20)  # 深棕色描边
         self.fill_color = QColor(0xE0, 0x80, 0x50)    # 浅橙色填充
 
@@ -412,9 +432,9 @@ class MainWindow(QMainWindow):
         # 标题栏左侧：图标 + 文字
         title_info = QHBoxLayout()
         icon_label = QLabel("🔆") 
-        icon_label.setStyleSheet("font-size: 10px; color: #ff7733;")
+        icon_label.setStyleSheet("font-size: 13px; color: #ff7733;")
         title_text = QLabel("iFlow2API")
-        title_text.setStyleSheet("font-family: 'Microsoft YaHei'; font-size: 10px; color: #bbbbbb; font-weight: bold;")
+        title_text.setStyleSheet("font-family: 'Microsoft YaHei'; font-size: 13px; color: #bbbbbb; font-weight: bold;")
         title_info.addWidget(icon_label)
         title_info.addWidget(title_text)
         title_bar_layout.addLayout(title_info)
@@ -423,13 +443,13 @@ class MainWindow(QMainWindow):
         
         # 标题栏右侧：最小化 + 关闭
         btn_min = QPushButton("－")
-        btn_min.setFixedSize(20, 20) # 再次缩小
-        btn_min.setStyleSheet("QPushButton { background: transparent; color: #888; font-size: 12px; border: none; } QPushButton:hover { color: #ffffff; background: #333333; }")
+        btn_min.setFixedSize(26, 26)
+        btn_min.setStyleSheet("QPushButton { background: transparent; color: #888; font-size: 15px; border: none; } QPushButton:hover { color: #ffffff; background: #333333; }")
         btn_min.clicked.connect(self.on_minimize_clicked)
         
         btn_close = QPushButton("×")
-        btn_close.setFixedSize(20, 20) # 再次缩小
-        btn_close.setStyleSheet("QPushButton { background: transparent; color: #888; font-size: 14px; border: none; border-top-right-radius: 10px; } QPushButton:hover { color: #ffffff; background: #ff5555; }")
+        btn_close.setFixedSize(26, 26)
+        btn_close.setStyleSheet("QPushButton { background: transparent; color: #888; font-size: 18px; border: none; border-top-right-radius: 10px; } QPushButton:hover { color: #ffffff; background: #ff5555; }")
         btn_close.clicked.connect(self.close)
         
         title_bar_layout.addWidget(btn_min)
@@ -536,7 +556,7 @@ class MainWindow(QMainWindow):
         self.prog_bar = QProgressBar()
         self.prog_bar.setRange(0, 100)
         self.prog_bar.setValue(0)
-        self.prog_bar.setFixedSize(88, 6)
+        self.prog_bar.setFixedSize(118, 9)
         self.rate_val = QLabel("0.0%")
         self.rate_val.setProperty("class", "StatValue")
         prog_container = QWidget()
@@ -559,8 +579,8 @@ class MainWindow(QMainWindow):
         lbl.setProperty("class", "StatLabel")
         stats_layout.addWidget(lbl, 3, 0, Qt.AlignRight)
         self.port_input = QLineEdit(str(DEFAULT_PORT))
-        self.port_input.setFixedWidth(62)
-        self.port_input.setFixedHeight(22)
+        self.port_input.setFixedWidth(80)
+        self.port_input.setFixedHeight(28)
         # 仅允许输入数字，且范围在1024-65535
         self.port_input.setValidator(QIntValidator(PORT_MIN, PORT_MAX))
         stats_layout.addWidget(self.port_input, 3, 1)
@@ -647,9 +667,9 @@ class MainWindow(QMainWindow):
         # 日志标题
         log_title_layout = QHBoxLayout()
         self.log_icon = QLabel("⚡")
-        self.log_icon.setStyleSheet("color: #ffbb00; font-size: 10px;")
+        self.log_icon.setStyleSheet("color: #ffbb00; font-size: 13px;")
         log_title = QLabel("系统日志")
-        log_title.setStyleSheet("color: #888888; font-size: 10px;")
+        log_title.setStyleSheet("color: #888888; font-size: 13px;")
         log_title_layout.addWidget(self.log_icon)
         log_title_layout.addWidget(log_title)
         log_title_layout.addStretch()
@@ -658,7 +678,7 @@ class MainWindow(QMainWindow):
         self.log_text = QTextEdit()
         self.log_text.setProperty("class", "LogText")
         self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(80) # 进一步压缩最小高度
+        self.log_text.setMinimumHeight(130)
         self.log_text.setHtml("")
 
         log_layout.addLayout(log_title_layout)
@@ -1012,13 +1032,14 @@ class MainWindow(QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("模型列表")
-        dialog.setFixedSize(420, 320)
+        dialog.setFixedSize(560, 440)
         dialog.setStyleSheet(Styles.get_style())
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
         text = QTextEdit()
+        text.setObjectName("DialogText")
         text.setReadOnly(True)
         text.setText(info)
-        text.setStyleSheet("QTextEdit { background: #1a0d05; color: #ff9966; border: 1px solid #ff5500; padding: 10px; font-family: 'Consolas', monospace; font-size: 9px; }")
         layout.addWidget(text)
         dialog.exec_()
 
@@ -1047,13 +1068,15 @@ curl http://localhost:{port}/v1/chat/completions \\
 
         dialog = QDialog(self)
         dialog.setWindowTitle("API 使用示例")
-        dialog.setFixedSize(600, 400)
+        dialog.setFixedSize(780, 560)
         dialog.setStyleSheet(Styles.get_style())
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
         text = QTextEdit()
+        text.setObjectName("DialogText")
         text.setReadOnly(True)
+        text.setLineWrapMode(QTextEdit.NoWrap)
         text.setText(examples)
-        text.setStyleSheet("QTextEdit { background: #000000; color: #ff9966; border: 1px solid #ff5500; padding: 10px; font-family: 'Consolas', monospace; font-size: 9px; }")
         layout.addWidget(text)
         dialog.exec_()
 
