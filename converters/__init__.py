@@ -435,7 +435,7 @@ def _map_finish_reason(reason: str) -> str:
 
 class StreamConverter:
 
-    def __init__(self, model: str, message_id: str):
+    def __init__(self, model: str, message_id: str, estimated_input_tokens: int = 0):
         self.model = model
         self.message_id = message_id
         self.content_accumulator = []
@@ -454,6 +454,10 @@ class StreamConverter:
         self.input_tokens = 0
         self.output_tokens = 0
         self.cached_tokens = 0
+        self.estimated_input_tokens = max(0, int(estimated_input_tokens or 0))
+        self.generated_text_chars = 0
+        self.generated_reasoning_chars = 0
+        self.generated_tool_args_chars = 0
 
     def convert_chunk(self, line: str) -> List[str]:
         """转换单个 chunk"""
@@ -491,6 +495,7 @@ class StreamConverter:
             for text in reasoning_texts:
                 if not text:
                     continue
+                self.generated_reasoning_chars += len(text)
                 self._stop_text_content_block(events)
                 if not self.thinking_content_block_started:
                     if self.thinking_content_block_index == -1:
@@ -503,6 +508,7 @@ class StreamConverter:
         # content
         if "content" in delta and delta["content"]:
             text = delta["content"]
+            self.generated_text_chars += len(text)
             if not self.text_content_block_started:
                 self._stop_thinking_content_block(events)
                 if self.text_content_block_index == -1:
@@ -540,6 +546,7 @@ class StreamConverter:
                 if tc_index in self.tool_calls_accumulator and "arguments" in func:
                     args_delta = func["arguments"]
                     if args_delta:
+                        self.generated_tool_args_chars += len(args_delta)
                         block_index = self.tool_call_block_indexes[tc_index]
                         self.tool_calls_accumulator[tc_index]["arguments"] += args_delta
 
@@ -621,12 +628,30 @@ class StreamConverter:
 
         # message_delta
         if self.finish_reason and not self.message_delta_sent:
-            events.append(f'event: message_delta\ndata: {json.dumps({"type": "message_delta", "delta": {"stop_reason": _map_finish_reason(self.finish_reason), "stop_sequence": None}})}\n\n')
+            input_tokens = self.input_tokens if self.input_tokens > 0 else self.estimated_input_tokens
+            output_tokens = self.output_tokens if self.output_tokens > 0 else self._estimate_output_tokens()
+            message_delta = {
+                "type": "message_delta",
+                "delta": {"stop_reason": _map_finish_reason(self.finish_reason), "stop_sequence": None},
+                "usage": {
+                    "input_tokens": max(0, int(input_tokens)),
+                    "output_tokens": max(0, int(output_tokens)),
+                },
+            }
+            if self.cached_tokens > 0:
+                message_delta["usage"]["cache_read_input_tokens"] = self.cached_tokens
+            events.append(f'event: message_delta\ndata: {json.dumps(message_delta)}\n\n')
             self.message_delta_sent = True
 
         self._emit_message_stop_if_needed(events)
 
         return events
+
+    def _estimate_output_tokens(self) -> int:
+        total_chars = self.generated_text_chars + self.generated_reasoning_chars + self.generated_tool_args_chars
+        if total_chars <= 0:
+            return 0
+        return max(1, (total_chars + 3) // 4)
 
     def _stop_thinking_content_block(self, events: List[str]):
         """停止 thinking content block"""

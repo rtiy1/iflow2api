@@ -219,7 +219,7 @@ def is_minimax_model(model_id: str) -> bool:
 def preserve_reasoning_content(body: Dict[str, Any], model: str) -> Dict[str, Any]:
     """Preserve reasoning_content in messages for GLM/MiniMax models.
 
-    For GLM-4.6/4.7 and MiniMax M2/M2.1, it's recommended to include the full
+    For GLM-4.6/4.7 and MiniMax M2/M2.1/M2.5, it's recommended to include the full
     assistant response (including reasoning_content) in message history for
     better context continuity in multi-turn conversations.
 

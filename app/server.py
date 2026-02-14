@@ -73,6 +73,72 @@ def _elapsed_ms(start_ts: float) -> int:
     return max(0, int((time.perf_counter() - start_ts) * 1000))
 
 
+def _estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def _estimate_content_tokens(content: Any) -> int:
+    if isinstance(content, str):
+        return _estimate_text_tokens(content)
+    if isinstance(content, list):
+        total = 0
+        for item in content:
+            if isinstance(item, str):
+                total += _estimate_text_tokens(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "text":
+                total += _estimate_text_tokens(str(item.get("text", "")))
+            elif item_type == "thinking":
+                total += _estimate_text_tokens(str(item.get("thinking", "")))
+            elif item_type in ("input_text", "output_text"):
+                total += _estimate_text_tokens(str(item.get("text", "")))
+            elif item_type == "tool_use":
+                try:
+                    total += _estimate_text_tokens(json.dumps(item.get("input", {}), ensure_ascii=False))
+                except Exception:
+                    pass
+            elif item_type == "tool_result":
+                total += _estimate_content_tokens(item.get("content", ""))
+        return total
+    return 0
+
+
+def _estimate_openai_prompt_tokens(body: Dict[str, Any]) -> int:
+    total = 0
+    messages = body.get("messages", [])
+    if not isinstance(messages, list):
+        return 0
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        total += _estimate_content_tokens(msg.get("content", ""))
+        if "reasoning_content" in msg:
+            total += _estimate_content_tokens(msg.get("reasoning_content"))
+    return total
+
+
+def _estimate_anthropic_input_tokens(body: Dict[str, Any]) -> int:
+    total = 0
+    if "system" in body:
+        total += _estimate_content_tokens(body.get("system"))
+
+    messages = body.get("messages", [])
+    if not isinstance(messages, list):
+        return total
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        total += _estimate_content_tokens(msg.get("content", ""))
+    return total
+
+
 def _append_request_log(
     *,
     method: str,
@@ -784,6 +850,7 @@ async def chat_completions(request: Request):
 
         if body.get("stream"):
             body["stream_options"] = {"include_usage": True}
+            estimated_prompt_tokens = _estimate_openai_prompt_tokens(body)
             reasoning_parts = []
             content_parts = []
 
@@ -794,6 +861,7 @@ async def chat_completions(request: Request):
                     current_body = body.copy()
                     accumulated_content = ""
                     accumulated_reasoning = ""
+                    saw_usage = False
 
                     while continuation_count <= MAX_CONTINUATIONS:
                         last_finish_reason = None
@@ -806,6 +874,8 @@ async def chat_completions(request: Request):
                                     choice = data.get("choices", [{}])[0]
                                     delta = choice.get("delta", {})
                                     last_finish_reason = choice.get("finish_reason")
+                                    if isinstance(data.get("usage"), dict):
+                                        saw_usage = True
 
                                     if delta.get("reasoning_content"):
                                         reasoning_parts.append(delta["reasoning_content"])
@@ -836,6 +906,22 @@ async def chat_completions(request: Request):
                         if accumulated_reasoning:
                             assistant_msg["reasoning_content"] = accumulated_reasoning
                         current_body["messages"] = current_body.get("messages", []) + [assistant_msg]
+
+                    if not saw_usage:
+                        estimated_completion_tokens = _estimate_text_tokens(accumulated_content + accumulated_reasoning)
+                        usage_chunk = {
+                            "id": f"chatcmpl_usage_{request_id}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": estimated_prompt_tokens,
+                                "completion_tokens": estimated_completion_tokens,
+                                "total_tokens": estimated_prompt_tokens + estimated_completion_tokens,
+                            },
+                        }
+                        yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
 
                     # 发送最终的 [DONE]
                     yield "data: [DONE]\n\n"
@@ -1004,24 +1090,7 @@ async def count_tokens(request: Request):
     except:
         return make_anthropic_error(400, "Invalid JSON", "invalid_request_error")
 
-    # 简单估算：每个字符约 0.25 token
-    def estimate_tokens(text: str) -> int:
-        return max(1, int(len(text) * 0.25))
-
-    total = 0
-    if body.get("system"):
-        total += estimate_tokens(body["system"])
-
-    for msg in body.get("messages", []):
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total += estimate_tokens(content)
-        elif isinstance(content, list):
-            for block in content:
-                if block.get("type") == "text":
-                    total += estimate_tokens(block.get("text", ""))
-
-    return {"input_tokens": total}
+    return {"input_tokens": _estimate_anthropic_input_tokens(body)}
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
@@ -1077,10 +1146,11 @@ async def anthropic_messages(request: Request):
             openai_req["stream_options"] = {"include_usage": True}
             reasoning_parts = []
             content_parts = []
+            estimated_input_tokens = _estimate_anthropic_input_tokens(body)
 
             async def stream():
                 try:
-                    converter = StreamConverter(model, msg_id)
+                    converter = StreamConverter(model, msg_id, estimated_input_tokens=estimated_input_tokens)
                     async for chunk in await proxy.proxy_request("/chat/completions", openai_req, model, stream=True):
                         line = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
                         if line and line.startswith("data: ") and not line.endswith("[DONE]"):

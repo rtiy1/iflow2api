@@ -36,6 +36,7 @@ iFlow 的 Python 反向代理，提供 OpenAI/Anthropic 兼容接口，包含 GU
 - `glm-4.7`
 - `glm-5`
 - `minimax-m2.1`
+- `minimax-m2.5`
 - `kimi-k2.5`
 
 GUI 的“模型列表”按钮读取的是这个接口，因此会看到上述补充模型。

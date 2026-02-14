@@ -39,9 +39,92 @@ EXTRA_MODELS = [
     "glm-4.7",
     "glm-5",
     "minimax-m2.1",
+    "minimax-m2.5",
     "kimi-k2.5",
     "iflow-rome-30ba3b",
 ]
+
+
+def _estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def _estimate_content_tokens(content: Any) -> int:
+    if isinstance(content, str):
+        return _estimate_text_tokens(content)
+    if isinstance(content, list):
+        total = 0
+        for item in content:
+            if isinstance(item, str):
+                total += _estimate_text_tokens(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "text":
+                total += _estimate_text_tokens(str(item.get("text", "")))
+            elif item_type == "reasoning":
+                total += _estimate_text_tokens(str(item.get("text", "")))
+            elif item_type == "tool_calls":
+                tool_calls = item.get("tool_calls", [])
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if not isinstance(tc, dict):
+                            continue
+                        func = tc.get("function", {})
+                        if isinstance(func, dict):
+                            total += _estimate_text_tokens(str(func.get("arguments", "")))
+            elif item_type == "tool_use":
+                try:
+                    total += _estimate_text_tokens(json.dumps(item.get("input", {}), ensure_ascii=False))
+                except Exception:
+                    pass
+            elif item_type == "tool_result":
+                total += _estimate_content_tokens(item.get("content", ""))
+        return total
+    return 0
+
+
+def _estimate_openai_prompt_tokens(body: Dict[str, Any]) -> int:
+    total = 0
+    messages = body.get("messages", [])
+    if not isinstance(messages, list):
+        return 0
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        total += _estimate_content_tokens(msg.get("content", ""))
+        if "reasoning_content" in msg:
+            total += _estimate_content_tokens(msg.get("reasoning_content"))
+    return total
+
+
+def _estimate_openai_completion_tokens(response_data: Dict[str, Any]) -> int:
+    choices = response_data.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return 0
+
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return 0
+
+    total = 0
+    message = choice.get("message", {})
+    if isinstance(message, dict):
+        total += _estimate_content_tokens(message.get("content", ""))
+        if "reasoning_content" in message:
+            total += _estimate_content_tokens(message.get("reasoning_content"))
+
+    delta = choice.get("delta", {})
+    if isinstance(delta, dict):
+        total += _estimate_content_tokens(delta.get("content", ""))
+        if "reasoning_content" in delta:
+            total += _estimate_content_tokens(delta.get("reasoning_content"))
+
+    return total
 
 
 def _create_iflow_signature(user_agent: str, session_id: str, timestamp_ms: int, api_key: str) -> str:
@@ -745,8 +828,14 @@ class ReverseProxy:
                 content = self._modify_response(response.content, response.status_code, response_headers)
                 result = json.loads(content)
 
-                if "usage" not in result:
-                    result["usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                if "usage" not in result or not isinstance(result.get("usage"), dict):
+                    prompt_tokens = _estimate_openai_prompt_tokens(body)
+                    completion_tokens = _estimate_openai_completion_tokens(result)
+                    result["usage"] = {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    }
 
                 return result
             except httpx.HTTPStatusError as e:
