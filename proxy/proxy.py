@@ -49,6 +49,8 @@ EXTRA_MODELS = [
 CREDENTIAL_POOL_RELOAD_INTERVAL = 5.0
 ACCOUNT_COOLDOWN_BASE_SECONDS = 30.0
 ACCOUNT_COOLDOWN_MAX_SECONDS = 300.0
+AUTO_REFRESH_CHECK_INTERVAL_SECONDS = 5.0
+AUTO_REFRESH_FAILURE_BACKOFF_SECONDS = 300.0
 ROUTING_STRATEGY_ROUND_ROBIN = "round-robin"
 ROUTING_STRATEGY_FILL_FIRST = "fill-first"
 
@@ -364,8 +366,10 @@ class CredentialAccount:
     file_path: str = ""
     enabled: bool = True
     priority: int = 0
+    account_identity: str = ""
     token_storage: Optional[IFlowTokenStorage] = None
     cooldown_until: float = 0.0
+    next_refresh_after: float = 0.0
     failure_count: int = 0
     last_error: str = ""
     selected_count: int = 0
@@ -834,6 +838,9 @@ class ReverseProxy:
         self._account_order: List[str] = []
         self._rr_cursors: Dict[str, int] = {}
         self._pool_last_loaded_at = 0.0
+        self._single_next_refresh_at = 0.0
+        self._auto_refresh_task: Optional[asyncio.Task] = None
+        self._auto_refresh_task_lock = asyncio.Lock()
 
     async def initialize(self):
         """初始化并刷新 token（如需要）"""
@@ -864,12 +871,27 @@ class ReverseProxy:
                 timeout=httpx.Timeout(300.0, connect=10.0),
                 follow_redirects=True,
             )
+        await self._ensure_auto_refresh_loop()
         return self._client
 
     async def close(self):
         """关闭客户端"""
+        if self._auto_refresh_task is not None:
+            self._auto_refresh_task.cancel()
+            try:
+                await self._auto_refresh_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._auto_refresh_task = None
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+
+    async def startup(self):
+        """预热代理并启动后台任务"""
+        await self.initialize()
+        await self._get_client()
 
     def _credential_dir_path(self) -> Optional[Path]:
         if not self.creds_dir:
@@ -908,6 +930,12 @@ class ReverseProxy:
             raw["apiKey"] = api_key
         token_storage = IFlowTokenStorage(raw)
         enabled = _parse_bool(raw.get("enabled"), default=True)
+        account_identity = str(
+            raw.get("account_identity")
+            or raw.get("email")
+            or raw.get("phone")
+            or ""
+        ).strip().lower()
         attributes = raw.get("attributes") if isinstance(raw.get("attributes"), dict) else {}
         priority = _parse_int(
             raw.get("priority", attributes.get("priority")),
@@ -919,6 +947,7 @@ class ReverseProxy:
             file_path=str(file_path),
             enabled=enabled,
             priority=priority,
+            account_identity=account_identity,
             token_storage=token_storage,
         )
 
@@ -941,13 +970,25 @@ class ReverseProxy:
 
             old_accounts = self._accounts
             new_accounts: Dict[str, CredentialAccount] = {}
+            seen_account_keys: set[str] = set()
             for file_path in files:
                 account = self._load_credential_account(file_path)
                 if account is None:
                     continue
+                dedupe_key = ""
+                if account.account_identity:
+                    dedupe_key = f"id:{account.account_identity}"
+                elif account.api_key:
+                    dedupe_key = f"key:{account.api_key.strip()}"
+                if dedupe_key and dedupe_key in seen_account_keys:
+                    logger.warning(f"[iFlow] 跳过重复账号凭证: {file_path}")
+                    continue
+                if dedupe_key:
+                    seen_account_keys.add(dedupe_key)
                 old = old_accounts.get(account.account_id)
                 if old is not None:
                     account.cooldown_until = old.cooldown_until
+                    account.next_refresh_after = old.next_refresh_after
                     account.failure_count = old.failure_count
                     account.last_error = old.last_error
                     account.selected_count = old.selected_count
@@ -1026,6 +1067,7 @@ class ReverseProxy:
                     or not account.token_storage.refresh_token
                     or not account.token_storage.is_expired()
                 ):
+                    account.next_refresh_after = 0.0
                     return copy.deepcopy(account)
                 file_path = account.file_path
                 refresh_token = account.token_storage.refresh_token
@@ -1041,6 +1083,7 @@ class ReverseProxy:
                                 current.api_key = latest.api_key
                                 current.failure_count = 0
                                 current.cooldown_until = 0.0
+                                current.next_refresh_after = 0.0
                                 current.last_error = ""
                             return copy.deepcopy(current)
 
@@ -1056,6 +1099,7 @@ class ReverseProxy:
                     if current is not None:
                         current.last_error = str(exc)
                         current.cooldown_until = max(current.cooldown_until, time.time() + ACCOUNT_COOLDOWN_BASE_SECONDS)
+                        current.next_refresh_after = time.time() + AUTO_REFRESH_FAILURE_BACKOFF_SECONDS
                         return copy.deepcopy(current)
                 return None
 
@@ -1068,8 +1112,90 @@ class ReverseProxy:
                     current.api_key = refreshed_storage.api_key
                 current.failure_count = 0
                 current.cooldown_until = 0.0
+                current.next_refresh_after = 0.0
                 current.last_error = ""
                 return copy.deepcopy(current)
+
+    async def _refresh_single_token_if_needed(self, now_ts: Optional[float] = None):
+        if not self.token_file_path:
+            return
+        current_ts = now_ts if now_ts is not None else time.time()
+        if current_ts < self._single_next_refresh_at:
+            return
+        async with self._single_refresh_lock:
+            current_ts = time.time()
+            if current_ts < self._single_next_refresh_at:
+                return
+            latest = await load_token_from_file(self.token_file_path)
+            if latest is not None:
+                self.token_storage = latest
+                if latest.api_key:
+                    self.api_key = latest.api_key
+            if self.token_storage is None:
+                self._single_next_refresh_at = current_ts + AUTO_REFRESH_CHECK_INTERVAL_SECONDS
+                return
+            if not self.token_storage.refresh_token or not self.token_storage.is_expired():
+                self._single_next_refresh_at = current_ts + AUTO_REFRESH_CHECK_INTERVAL_SECONDS
+                return
+            try:
+                refreshed = await refresh_oauth_tokens(self.token_storage.refresh_token)
+                self.token_storage = IFlowTokenStorage(refreshed)
+                await save_token_to_file(self.token_file_path, self.token_storage)
+                if self.token_storage.api_key:
+                    self.api_key = self.token_storage.api_key
+                self._single_next_refresh_at = current_ts + AUTO_REFRESH_CHECK_INTERVAL_SECONDS
+                logger.info("[iFlow] 单账号 token 已后台刷新")
+            except Exception as exc:
+                self._single_next_refresh_at = current_ts + AUTO_REFRESH_FAILURE_BACKOFF_SECONDS
+                logger.warning(f"[iFlow] 单账号 token 后台刷新失败: {exc}")
+
+    async def _run_auto_refresh_once(self):
+        now_ts = time.time()
+        await self._refresh_single_token_if_needed(now_ts)
+        has_pool = await self._reload_account_pool_if_needed()
+        if not has_pool:
+            return
+        async with self._pool_lock:
+            candidate_ids: List[str] = []
+            for account_id in self._account_order:
+                account = self._accounts.get(account_id)
+                if account is None:
+                    continue
+                if account.next_refresh_after > now_ts:
+                    continue
+                if (
+                    account.token_storage is None
+                    or not account.token_storage.refresh_token
+                    or not account.token_storage.is_expired()
+                ):
+                    continue
+                candidate_ids.append(account_id)
+        for account_id in candidate_ids:
+            try:
+                await self._ensure_pool_account_fresh(account_id)
+            except Exception as exc:
+                logger.warning(f"[iFlow] 后台刷新账号凭证失败 ({account_id}): {exc}")
+
+    async def _auto_refresh_loop(self):
+        logger.info("[iFlow] 后台凭证刷新循环已启动")
+        try:
+            while True:
+                try:
+                    await self._run_auto_refresh_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(f"[iFlow] 后台凭证刷新循环异常: {exc}")
+                await asyncio.sleep(AUTO_REFRESH_CHECK_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            logger.info("[iFlow] 后台凭证刷新循环已停止")
+            raise
+
+    async def _ensure_auto_refresh_loop(self):
+        async with self._auto_refresh_task_lock:
+            if self._auto_refresh_task is not None and not self._auto_refresh_task.done():
+                return
+            self._auto_refresh_task = asyncio.create_task(self._auto_refresh_loop())
 
     async def _select_account(self, route_key: str = "*") -> CredentialAccount:
         has_pool = await self._reload_account_pool_if_needed()
@@ -1082,7 +1208,8 @@ class ReverseProxy:
                 return account
             raise RuntimeError("credential refresh failed")
 
-        await self.initialize()
+        if self.token_storage is None and self.token_file_path:
+            await self.initialize()
         return CredentialAccount(
             account_id="default",
             api_key=self.api_key,
@@ -1162,6 +1289,7 @@ class ReverseProxy:
                         "available": account.is_available(now_ts),
                         "priority": account.priority,
                         "weight": account.priority,
+                        "account_identity": account.account_identity,
                         "failure_count": account.failure_count,
                         "cooldown_seconds": cooldown_seconds,
                         "selected_count": account.selected_count,

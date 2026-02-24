@@ -38,14 +38,14 @@ class IFlowTokenStorage:
         }
 
     def is_expired(self) -> bool:
-        """检查 Token 是否过期（提前 45 小时判断）"""
+        """检查 Token 是否过期（提前 5 分钟判断）"""
         try:
             if not self.expiry_date:
                 return False
 
             current_time = int(time.time() * 1000)
-            cron_near_minutes = 60 * 45  # 45 小时
-            cron_near_minutes_in_millis = cron_near_minutes * 60 * 1000
+            refresh_lead_minutes = 5
+            refresh_lead_in_millis = refresh_lead_minutes * 60 * 1000
 
             # 解析过期时间
             expire_value = self.expiry_date
@@ -74,7 +74,7 @@ class IFlowTokenStorage:
 
             # 判断是否已过期或接近过期
             is_expired_flag = time_remaining <= 0
-            is_near = time_remaining > 0 and time_remaining <= cron_near_minutes_in_millis
+            is_near = time_remaining > 0 and time_remaining <= refresh_lead_in_millis
             needs_refresh = is_expired_flag or is_near
 
             from datetime import datetime
@@ -82,7 +82,7 @@ class IFlowTokenStorage:
             time_remaining_minutes = time_remaining // 60000
             time_remaining_hours = round(time_remaining / 3600000, 2)
 
-            print(f"[iFlow] Token expiry check: Expiry={expire_date_str}, Remaining={time_remaining_hours}h ({time_remaining_minutes}min), Threshold={cron_near_minutes}min, Expired={is_expired_flag}, Near={is_near}, NeedsRefresh={needs_refresh}")
+            print(f"[iFlow] Token expiry check: Expiry={expire_date_str}, Remaining={time_remaining_hours}h ({time_remaining_minutes}min), Threshold={refresh_lead_minutes}min, Expired={is_expired_flag}, Near={is_near}, NeedsRefresh={needs_refresh}")
 
             return needs_refresh
         except Exception as e:

@@ -190,6 +190,8 @@ async def start_oauth_flow(save_path: Optional[str] = None, on_auth_url=None) ->
         "token_type": token_data["token_type"],
         "scope": token_data["scope"],
         "apiKey": user_info["apiKey"],
+        "account_identity": user_info["email"],
+        "email": user_info["email"],
         "routing_strategy": "round-robin",
         "routingStrategy": "round-robin",
     }

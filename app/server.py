@@ -31,7 +31,17 @@ from converters import (
     StreamConverter,
 )
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    proxy = get_proxy()
+    await proxy.startup()
+    try:
+        yield
+    finally:
+        await proxy.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 def _truncate_text(value: Any, limit: int = 4000) -> str:

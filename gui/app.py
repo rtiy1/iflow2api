@@ -14,13 +14,13 @@ import sys
 import threading
 import asyncio
 import json
+import hashlib
 import uvicorn
 import webbrowser
 import platform
 import psutil
 import os
 import time
-import re
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -1215,8 +1215,13 @@ class MainWindow(QMainWindow):
                         webbrowser.open(url)
 
                     credentials = loop.run_until_complete(start_oauth_flow(on_auth_url=open_browser))
-                    account_id, saved_path = self._save_account_to_pool(credentials)
-                    self.log_signal.emit(f"✓ 账号添加成功：{account_id}")
+                    account_id, saved_path, replaced, removed_count = self._save_account_to_pool(credentials)
+                    if replaced:
+                        self.log_signal.emit(f"✓ 检测到同账号，已更新凭证：{account_id}")
+                    else:
+                        self.log_signal.emit(f"✓ 账号添加成功：{account_id}")
+                    if removed_count > 0:
+                        self.log_signal.emit(f"✓ 已清理 {removed_count} 个重复凭证文件")
                     self.log_signal.emit(f"凭证文件已写入：{saved_path}")
                 except Exception as e:
                     self.log_signal.emit(f"✗ 账号添加失败: {e}")
@@ -1269,29 +1274,80 @@ class MainWindow(QMainWindow):
         api_key = str(credentials.get("apiKey") or "").strip()
         if not api_key:
             raise ValueError("未获取到 apiKey，无法写入账号池")
-
-        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        suffix = re.sub(r"[^A-Za-z0-9]", "", api_key[-6:]).lower() or "acct"
-        account_id_base = f"acct_{now}_{suffix}"
+        refresh_token = str(credentials.get("refresh_token") or "").strip()
+        account_identity = str(
+            credentials.get("account_identity")
+            or credentials.get("email")
+            or credentials.get("phone")
+            or ""
+        ).strip().lower()
+        account_seed = account_identity or api_key
+        account_id_base = f"acct_{hashlib.sha1(account_seed.encode('utf-8')).hexdigest()[:12]}"
 
         creds_dir = self._resolve_creds_dir()
         creds_dir.mkdir(parents=True, exist_ok=True)
 
-        account_id = account_id_base
-        file_path = creds_dir / f"{account_id}.json"
-        idx = 1
-        while file_path.exists():
-            account_id = f"{account_id_base}_{idx}"
+        matched_files: List[Path] = []
+        matched_account_id = ""
+        for existing_file in sorted(creds_dir.glob("*.json")):
+            if existing_file.name.lower() == "index.json":
+                continue
+            try:
+                existing_payload = json.loads(existing_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(existing_payload, dict):
+                continue
+            existing_api_key = str(existing_payload.get("apiKey") or existing_payload.get("api_key") or "").strip()
+            existing_refresh = str(existing_payload.get("refresh_token") or "").strip()
+            existing_identity = str(
+                existing_payload.get("account_identity")
+                or existing_payload.get("email")
+                or existing_payload.get("phone")
+                or ""
+            ).strip().lower()
+            same_identity = bool(account_identity) and bool(existing_identity) and existing_identity == account_identity
+            same_api_key = bool(api_key) and existing_api_key == api_key
+            same_refresh_token = bool(refresh_token) and bool(existing_refresh) and existing_refresh == refresh_token
+            if not (same_identity or same_api_key or same_refresh_token):
+                continue
+            matched_files.append(existing_file)
+            if matched_account_id:
+                continue
+            matched_account_id = str(existing_payload.get("account_id") or existing_payload.get("id") or existing_file.stem).strip()
+            if not matched_account_id:
+                matched_account_id = existing_file.stem
+
+        replaced = len(matched_files) > 0
+        removed_count = 0
+        if replaced:
+            matched_file = matched_files[0]
+            account_id = matched_account_id
+            file_path = matched_file
+            for duplicate_file in matched_files[1:]:
+                try:
+                    duplicate_file.unlink()
+                    removed_count += 1
+                except Exception:
+                    pass
+        else:
+            account_id = account_id_base
             file_path = creds_dir / f"{account_id}.json"
-            idx += 1
+            idx = 1
+            while file_path.exists():
+                account_id = f"{account_id_base}_{idx}"
+                file_path = creds_dir / f"{account_id}.json"
+                idx += 1
 
         payload = dict(credentials)
         payload["account_id"] = account_id
         payload["enabled"] = True
         payload["priority"] = int(payload.get("priority") or 0)
+        if account_identity:
+            payload["account_identity"] = account_identity
         file_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        return account_id, str(file_path)
+        return account_id, str(file_path), replaced, removed_count
 
     @pyqtSlot()
     def show_system_info(self):
