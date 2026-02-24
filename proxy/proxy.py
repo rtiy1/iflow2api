@@ -15,7 +15,7 @@ import time
 import uuid
 import copy
 from urllib.parse import unquote
-from typing import AsyncIterator, Optional, Dict, Any, List
+from typing import AsyncIterator, Optional, Dict, Any, List, Tuple
 
 # 重试配置
 MAX_RETRIES = 3
@@ -125,6 +125,194 @@ def _estimate_openai_completion_tokens(response_data: Dict[str, Any]) -> int:
             total += _estimate_content_tokens(delta.get("reasoning_content"))
 
     return total
+
+
+def _parse_numeric_status(value: Any) -> Optional[int]:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return None
+
+
+def _normalize_iflow_business_status(status_code: int) -> int:
+    # iFlow 业务状态码 449 通常表示限流，映射为标准 429。
+    if status_code == 449:
+        return 429
+    return status_code
+
+
+def _parse_iflow_business_error(payload: Any) -> Optional[Tuple[int, str]]:
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("choices"), list):
+        return None
+
+    status_code = _parse_numeric_status(payload.get("status"))
+    if status_code is None:
+        return None
+
+    normalized = _normalize_iflow_business_status(status_code)
+    if normalized < 400:
+        return None
+
+    message = str(payload.get("msg") or payload.get("message") or "upstream business error")
+    return normalized, message
+
+
+def _build_http_status_error(
+    status_code: int,
+    message: str,
+    request: httpx.Request,
+    payload: Optional[Any] = None,
+) -> httpx.HTTPStatusError:
+    content = b""
+    if payload is not None:
+        try:
+            content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        except Exception:
+            content = b""
+    response = httpx.Response(
+        status_code=status_code,
+        request=request,
+        headers={"content-type": "application/json"},
+        content=content,
+    )
+    return httpx.HTTPStatusError(message=message, request=request, response=response)
+
+
+def _extract_sse_data_text(event: bytes) -> str:
+    try:
+        text = event.decode("utf-8")
+    except UnicodeDecodeError:
+        text = event.decode("utf-8", errors="ignore")
+    lines = text.splitlines()
+    data_lines: List[str] = []
+    for line in lines:
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    return "\n".join(data_lines).strip()
+
+
+def _parse_sse_json(event: bytes) -> Optional[Dict[str, Any]]:
+    data_text = _extract_sse_data_text(event)
+    if not data_text or data_text == "[DONE]":
+        return None
+    try:
+        parsed = json.loads(data_text)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _is_done_event(event: bytes) -> bool:
+    return _extract_sse_data_text(event) == "[DONE]"
+
+
+def _is_network_error_without_content(event: bytes) -> bool:
+    payload = _parse_sse_json(event)
+    if not isinstance(payload, dict):
+        return False
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    if not isinstance(first, dict):
+        return False
+    if first.get("finish_reason") != "network_error":
+        return False
+    delta = first.get("delta")
+    if not isinstance(delta, dict):
+        return True
+    has_content = bool(delta.get("content")) or bool(delta.get("reasoning_content")) or bool(delta.get("tool_calls"))
+    return not has_content
+
+
+def _event_has_meaningful_delta(event: bytes) -> bool:
+    payload = _parse_sse_json(event)
+    if not isinstance(payload, dict):
+        return False
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    if not isinstance(first, dict):
+        return False
+    delta = first.get("delta")
+    if not isinstance(delta, dict):
+        return False
+    return bool(delta.get("content")) or bool(delta.get("reasoning_content")) or bool(delta.get("tool_calls"))
+
+
+def _synthesize_stream_chunks_from_non_stream(payload: Any) -> List[bytes]:
+    if not isinstance(payload, dict):
+        return []
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return []
+
+    chunk_payload: Dict[str, Any] = {
+        "id": payload.get("id", ""),
+        "object": "chat.completion.chunk",
+        "created": payload.get("created", int(time.time())),
+        "model": payload.get("model", ""),
+        "choices": [],
+    }
+
+    for idx, choice in enumerate(choices):
+        if not isinstance(choice, dict):
+            continue
+        stream_choice: Dict[str, Any] = {
+            "index": choice.get("index", idx),
+            "delta": {},
+            "finish_reason": choice.get("finish_reason"),
+        }
+
+        message = choice.get("message")
+        if isinstance(message, dict):
+            if message.get("role"):
+                stream_choice["delta"]["role"] = message.get("role")
+            if message.get("content") is not None:
+                stream_choice["delta"]["content"] = message.get("content")
+            if message.get("reasoning_content") is not None:
+                stream_choice["delta"]["reasoning_content"] = message.get("reasoning_content")
+            if message.get("tool_calls") is not None:
+                stream_choice["delta"]["tool_calls"] = message.get("tool_calls")
+
+        chunk_payload["choices"].append(stream_choice)
+
+    if not chunk_payload["choices"]:
+        return []
+
+    output = [
+        f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n".encode("utf-8"),
+    ]
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        usage_chunk = {
+            "id": chunk_payload["id"],
+            "object": "chat.completion.chunk",
+            "created": chunk_payload["created"],
+            "model": chunk_payload["model"],
+            "choices": [],
+            "usage": usage,
+        }
+        output.append(f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+    return output
+
+
+def _extract_iflow_request_ids(body: Dict[str, Any]) -> Tuple[str, str]:
+    conversation_id = str(body.get("conversation_id") or body.get("conversationId") or "").strip()
+    session_id = str(body.get("session_id") or body.get("sessionId") or "").strip()
+
+    if not session_id and conversation_id:
+        session_id = conversation_id
+    if not session_id:
+        session_id = f"session-{uuid.uuid4()}"
+
+    return session_id, conversation_id
 
 
 def _create_iflow_signature(user_agent: str, session_id: str, timestamp_ms: int, api_key: str) -> str:
@@ -620,19 +808,35 @@ class ReverseProxy:
 
         return modified
 
-    def _apply_iflow_security_headers(self, headers: Dict[str, str]) -> Dict[str, str]:
+    def _apply_iflow_security_headers(
+        self,
+        headers: Dict[str, str],
+        *,
+        with_signature: bool = True,
+        session_id: Optional[str] = None,
+        conversation_id: str = "",
+    ) -> Dict[str, str]:
 
         modified = headers.copy()
-        session_id = f"session-{uuid.uuid4()}"
-        timestamp_ms = int(time.time() * 1000)
+        if not session_id:
+            session_id = f"session-{uuid.uuid4()}"
 
         modified["session-id"] = session_id
-        modified["x-iflow-timestamp"] = str(timestamp_ms)
+        modified["conversation-id"] = conversation_id
+        # 对齐 iFlow CLI 行为，不显式设置 Accept。
+        modified.pop("accept", None)
+        modified.pop("Accept", None)
 
-        signature = _create_iflow_signature(IFLOW_CLI_USER_AGENT, session_id, timestamp_ms, self.api_key)
-        if signature:
-            modified["x-iflow-signature"] = signature
+        if with_signature:
+            timestamp_ms = int(time.time() * 1000)
+            modified["x-iflow-timestamp"] = str(timestamp_ms)
+            signature = _create_iflow_signature(IFLOW_CLI_USER_AGENT, session_id, timestamp_ms, self.api_key)
+            if signature:
+                modified["x-iflow-signature"] = signature
+            else:
+                modified.pop("x-iflow-signature", None)
         else:
+            modified.pop("x-iflow-timestamp", None)
             modified.pop("x-iflow-signature", None)
 
         return modified
@@ -813,20 +1017,51 @@ class ReverseProxy:
     ):
         """非流式代理 - 带重试"""
         last_error = None
+        session_id, conversation_id = _extract_iflow_request_ids(body)
+        non_retry_statuses = {400, 401, 403, 404, 405, 406, 409, 410, 413, 415, 422, 429}
         for attempt in range(MAX_RETRIES):
             try:
-                request_headers = self._apply_iflow_security_headers(headers)
+                request_headers = self._apply_iflow_security_headers(
+                    headers,
+                    with_signature=True,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                )
                 response = await client.post(
                     f"{self.upstream_url}{endpoint}",
                     headers=request_headers,
                     json=body,
                 )
+                if response.status_code == 406:
+                    logger.warning("[iFlow] 检测到 406，尝试去签名重试")
+                    retry_headers = self._apply_iflow_security_headers(
+                        headers,
+                        with_signature=False,
+                        session_id=session_id,
+                        conversation_id=conversation_id,
+                    )
+                    response = await client.post(
+                        f"{self.upstream_url}{endpoint}",
+                        headers=retry_headers,
+                        json=body,
+                    )
                 response.raise_for_status()
 
                 # 修改响应
                 response_headers = dict(response.headers)
                 content = self._modify_response(response.content, response.status_code, response_headers)
                 result = json.loads(content)
+                business_error = _parse_iflow_business_error(result)
+                if business_error is not None:
+                    mapped_status, message = business_error
+                    err = _build_http_status_error(
+                        mapped_status,
+                        f"iFlow business error: {message}",
+                        response.request,
+                        payload=result,
+                    )
+                    setattr(err, "_iflow_business_error", True)
+                    raise err
 
                 if "usage" not in result or not isinstance(result.get("usage"), dict):
                     prompt_tokens = _estimate_openai_prompt_tokens(body)
@@ -852,11 +1087,15 @@ class ReverseProxy:
                         has_images=has_images,
                         allow_vision_fallback=False,
                     )
+                if getattr(e, "_iflow_business_error", False):
+                    raise
                 last_error = e
                 status_code = e.response.status_code
                 logger.warning(f"上游 API 错误 (尝试 {attempt + 1}/{MAX_RETRIES}): HTTP {status_code} - {e}")
-                if attempt < MAX_RETRIES - 1:
+                if attempt < MAX_RETRIES - 1 and status_code not in non_retry_statuses:
                     await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                else:
+                    break
             except Exception as e:
                 last_error = e
                 logger.warning(f"请求失败 (尝试 {attempt + 1}/{MAX_RETRIES}): {e}")
@@ -881,32 +1120,108 @@ class ReverseProxy:
         has_images: bool,
         allow_vision_fallback: bool = True,
     ) -> AsyncIterator[bytes]:
+        session_id, conversation_id = _extract_iflow_request_ids(body)
+        response: Optional[httpx.Response] = None
 
-        try:
-            request_headers = self._apply_iflow_security_headers(headers)
-            async with client.stream(
+        async def _send_stream_once(with_signature: bool) -> httpx.Response:
+            request_headers = self._apply_iflow_security_headers(
+                headers,
+                with_signature=with_signature,
+                session_id=session_id,
+                conversation_id=conversation_id,
+            )
+            request = client.build_request(
                 "POST",
                 f"{self.upstream_url}{endpoint}",
                 headers=request_headers,
                 json=body,
-            ) as response:
-                response.raise_for_status()
+            )
+            return await client.send(request, stream=True)
 
-                # 使用缓冲区按 SSE 事件边界分割
-                # SSE 事件以 \n\n 分隔
-                buffer = b""
-                async for chunk in response.aiter_bytes():
-                    buffer += chunk
+        try:
+            response = await _send_stream_once(with_signature=True)
+            if response.status_code == 406:
+                first_error_body = await response.aread()
+                logger.warning(f"[iFlow] 流式请求收到 406，准备去签名重试；body={first_error_body[:300]!r}")
+                await response.aclose()
+                response = await _send_stream_once(with_signature=False)
 
-                    # 查找完整的 SSE 事件（以 \n\n 结尾）
-                    while b"\n\n" in buffer:
-                        event, buffer = buffer.split(b"\n\n", 1)
-                        # 发送完整的 SSE 事件（包含 \n\n）
-                        yield event + b"\n\n"
+            response.raise_for_status()
+            content_type = str(response.headers.get("content-type", "")).lower()
+            if not is_streaming_response(content_type):
+                raw = await response.aread()
+                parsed_payload: Optional[Dict[str, Any]] = None
+                try:
+                    decoded = raw.decode("utf-8")
+                    loaded = json.loads(decoded)
+                    if isinstance(loaded, dict):
+                        parsed_payload = loaded
+                except Exception:
+                    parsed_payload = None
 
-                # 处理剩余数据（如果有）
-                if buffer:
-                    yield buffer
+                if parsed_payload is not None:
+                    business_error = _parse_iflow_business_error(parsed_payload)
+                    if business_error is not None:
+                        mapped_status, message = business_error
+                        err = _build_http_status_error(
+                            mapped_status,
+                            f"iFlow business error: {message}",
+                            response.request,
+                            payload=parsed_payload,
+                        )
+                        setattr(err, "_iflow_business_error", True)
+                        raise err
+
+                    synthesized = _synthesize_stream_chunks_from_non_stream(parsed_payload)
+                    if synthesized:
+                        logger.warning("[iFlow] 上游返回非 SSE JSON，已执行流式回退合成")
+                        for chunk in synthesized:
+                            yield chunk
+                        yield b"data: [DONE]\n\n"
+                        return
+
+                raise _build_http_status_error(
+                    502,
+                    "Upstream returned non-SSE stream response without valid choices",
+                    response.request,
+                )
+
+            # 使用缓冲区按 SSE 事件边界分割。SSE 事件以 \n\n 分隔。
+            buffer = b""
+            saw_done = False
+            emitted_payload = False
+            async for chunk in response.aiter_bytes():
+                buffer += chunk
+
+                while b"\n\n" in buffer:
+                    event, buffer = buffer.split(b"\n\n", 1)
+                    if _event_has_meaningful_delta(event):
+                        emitted_payload = True
+                    if _is_network_error_without_content(event) and not emitted_payload:
+                        raise _build_http_status_error(
+                            502,
+                            "Upstream stream ended with network_error before any content",
+                            response.request,
+                        )
+                    if _is_done_event(event):
+                        saw_done = True
+                    yield event + b"\n\n"
+
+            if buffer:
+                if _event_has_meaningful_delta(buffer):
+                    emitted_payload = True
+                if _is_network_error_without_content(buffer) and not emitted_payload:
+                    raise _build_http_status_error(
+                        502,
+                        "Upstream stream ended with network_error before any content",
+                        response.request,
+                    )
+                if _is_done_event(buffer):
+                    saw_done = True
+                yield buffer if buffer.endswith(b"\n\n") else buffer + b"\n\n"
+
+            if not saw_done:
+                yield b"data: [DONE]\n\n"
         except httpx.HTTPStatusError as e:
             if allow_vision_fallback and _should_fallback_to_forced_vision(e, model=model, has_images=has_images):
                 logger.info(f"[iFlow] 原模型不支持图片输入，流式回退视觉模型: {model} -> {FORCED_VISION_MODEL}")
@@ -928,6 +1243,9 @@ class ReverseProxy:
         except Exception as e:
             logger.error(f"amp upstream proxy error for POST {endpoint}: {e}")
             raise
+        finally:
+            if response is not None:
+                await response.aclose()
 
     async def get_models(self) -> Dict[str, Any]:
         """获取模型列表"""

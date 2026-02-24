@@ -188,6 +188,35 @@ def make_openai_error(status: int, message: str, err_type: str = "api_error"):
 def make_anthropic_error(status: int, message: str, err_type: str = "api_error"):
     return JSONResponse({"type": "error", "error": {"type": err_type, "message": message}}, status_code=status)
 
+
+def map_upstream_status(status_code: int) -> int:
+    # 透传具有明确客户端语义的上游状态，其余统一为网关错误。
+    if status_code in (429, 503):
+        return status_code
+    return 502
+
+
+def format_openai_stream_error_chunk(status: int, message: str, err_type: str = "upstream_error") -> str:
+    payload = {
+        "error": {
+            "message": message,
+            "type": err_type,
+            "code": status,
+        }
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def format_anthropic_stream_error_event(message: str, err_type: str = "api_error") -> str:
+    payload = {
+        "type": "error",
+        "error": {
+            "type": err_type,
+            "message": message,
+        },
+    }
+    return f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     response = await call_next(request)
@@ -945,10 +974,11 @@ async def chat_completions(request: Request):
                     stats["total"] += 1
                     stats["error"] += 1
                     upstream_status = e.response.status_code
+                    client_status = map_upstream_status(upstream_status)
                     _append_request_log(
                         method="POST",
                         path="/v1/chat/completions",
-                        status=502,
+                        status=client_status,
                         model=model,
                         request_id=request_id,
                         latency_ms=_elapsed_ms(request_started),
@@ -959,7 +989,13 @@ async def chat_completions(request: Request):
                         upstream_status=upstream_status,
                     )
                     logger.error(f"上游 API 返回错误 HTTP {upstream_status} for model={model}: {e}")
-                    raise
+                    yield format_openai_stream_error_chunk(
+                        client_status,
+                        f"Upstream API error: HTTP {upstream_status}",
+                        "upstream_error",
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
                 except Exception as e:
                     stats["total"] += 1
                     stats["error"] += 1
@@ -976,7 +1012,9 @@ async def chat_completions(request: Request):
                         effective_model=model,
                     )
                     logger.error(f"请求处理失败 for model={model}: {type(e).__name__}: {e}")
-                    raise
+                    yield format_openai_stream_error_chunk(500, str(e), "internal_error")
+                    yield "data: [DONE]\n\n"
+                    return
 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -1050,10 +1088,11 @@ async def chat_completions(request: Request):
         stats["total"] += 1
         stats["error"] += 1
         status_code = e.response.status_code
+        client_status = map_upstream_status(status_code)
         _append_request_log(
             method="POST",
             path="/v1/chat/completions",
-            status=502,
+            status=client_status,
             model=model,
             request_id=request_id,
             latency_ms=_elapsed_ms(request_started),
@@ -1064,7 +1103,7 @@ async def chat_completions(request: Request):
             upstream_status=status_code,
         )
         logger.error(f"上游 API 返回错误 HTTP {status_code} for model={model}: {e}")
-        return make_openai_error(502, f"Upstream API error: HTTP {status_code}", "upstream_error")
+        return make_openai_error(client_status, f"Upstream API error: HTTP {status_code}", "upstream_error")
     except Exception as e:
         stats["total"] += 1
         stats["error"] += 1
@@ -1186,10 +1225,11 @@ async def anthropic_messages(request: Request):
                     stats["total"] += 1
                     stats["error"] += 1
                     upstream_status = e.response.status_code
+                    client_status = map_upstream_status(upstream_status)
                     _append_request_log(
                         method="POST",
                         path="/v1/messages",
-                        status=502,
+                        status=client_status,
                         model=model,
                         request_id=request_id,
                         latency_ms=_elapsed_ms(request_started),
@@ -1200,7 +1240,11 @@ async def anthropic_messages(request: Request):
                         upstream_status=upstream_status,
                     )
                     logger.error(f"上游 API 返回错误 HTTP {upstream_status} for model={model}: {e}")
-                    raise
+                    yield format_anthropic_stream_error_event(
+                        f"Upstream API error: HTTP {upstream_status}",
+                        "upstream_error",
+                    )
+                    return
                 except Exception as e:
                     stats["total"] += 1
                     stats["error"] += 1
@@ -1216,7 +1260,8 @@ async def anthropic_messages(request: Request):
                         error=f"{type(e).__name__}: {e}",
                         effective_model=model,
                     )
-                    raise
+                    yield format_anthropic_stream_error_event(str(e), "internal_error")
+                    return
 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -1244,10 +1289,11 @@ async def anthropic_messages(request: Request):
         stats["total"] += 1
         stats["error"] += 1
         status_code = e.response.status_code
+        client_status = map_upstream_status(status_code)
         _append_request_log(
             method="POST",
             path="/v1/messages",
-            status=502,
+            status=client_status,
             model=model,
             request_id=request_id,
             latency_ms=_elapsed_ms(request_started),
@@ -1258,7 +1304,7 @@ async def anthropic_messages(request: Request):
             upstream_status=status_code,
         )
         logger.error(f"上游 API 返回错误 HTTP {status_code} for model={model}: {e}")
-        return make_anthropic_error(502, f"Upstream API error: HTTP {status_code}", "upstream_error")
+        return make_anthropic_error(client_status, f"Upstream API error: HTTP {status_code}", "upstream_error")
     except Exception as e:
         stats["total"] += 1
         stats["error"] += 1
