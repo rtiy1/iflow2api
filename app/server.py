@@ -320,6 +320,74 @@ async def admin_page():
             border: 1px solid #2f3d68;
         }
 
+        .accounts-container { margin-bottom: 20px; }
+        .account-summary {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+        .summary-chip {
+            padding: 6px 10px;
+            border-radius: 999px;
+            border: 1px solid #30406d;
+            background: rgba(22, 34, 63, 0.8);
+            font-size: 0.8rem;
+            color: #d4e3ff;
+        }
+        .summary-chip strong {
+            color: #f0f6ff;
+            margin-left: 4px;
+            font-family: "JetBrains Mono", "Cascadia Code", "Consolas", monospace;
+        }
+        .accounts-list {
+            display: grid;
+            gap: 10px;
+        }
+        .account-item {
+            border: 1px solid #2a3a64;
+            border-radius: 9px;
+            padding: 10px 12px;
+            background: rgba(14, 24, 46, 0.72);
+        }
+        .account-head {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 7px;
+        }
+        .account-id {
+            font-family: "JetBrains Mono", "Cascadia Code", "Consolas", monospace;
+            color: #dbe8ff;
+            font-size: 0.84rem;
+            word-break: break-all;
+        }
+        .account-status {
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+        }
+        .account-status.ok { background: rgba(47, 209, 143, 0.2); color: var(--success); }
+        .account-status.cooldown { background: rgba(243, 178, 79, 0.2); color: var(--warning); }
+        .account-status.offline { background: rgba(255, 107, 129, 0.2); color: var(--danger); }
+        .account-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px 12px;
+            color: #9cb0d7;
+            font-size: 0.76rem;
+        }
+        .account-error {
+            margin-top: 6px;
+            color: #ff9aab;
+            font-size: 0.74rem;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
         .usage-section { margin-top: 20px; }
         .example-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
         .example-title {
@@ -515,6 +583,20 @@ async def admin_page():
             <div class="section-title">📦 可用模型</div>
             <div class="card">
                 <div id="models" class="chip-container">加载中...</div>
+            </div>
+        </div>
+
+        <div class="accounts-container">
+            <div class="section-title">👥 凭证账号池</div>
+            <div class="card">
+                <div class="account-summary">
+                    <span class="summary-chip">模式<strong id="accounts-mode">-</strong></span>
+                    <span class="summary-chip">总账号<strong id="accounts-total">0</strong></span>
+                    <span class="summary-chip">可用账号<strong id="accounts-available">0</strong></span>
+                </div>
+                <div id="accounts-list" class="accounts-list">
+                    <div class="empty-state">账号池信息加载中...</div>
+                </div>
             </div>
         </div>
 
@@ -732,8 +814,72 @@ async def admin_page():
             }
         }
 
+        async function refreshAccounts() {
+            const container = document.getElementById('accounts-list');
+            try {
+                const res = await fetch('/admin/accounts?t=' + Date.now());
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const payload = await res.json();
+
+                const mode = payload.mode || '-';
+                const total = payload.total_accounts ?? 0;
+                const available = payload.available_accounts ?? 0;
+                const rows = Array.isArray(payload.accounts) ? payload.accounts : [];
+
+                document.getElementById('accounts-mode').textContent = mode;
+                document.getElementById('accounts-total').textContent = String(total);
+                document.getElementById('accounts-available').textContent = String(available);
+
+                if (rows.length === 0) {
+                    container.innerHTML = '<div class="empty-state">暂无可用账号配置</div>';
+                    return;
+                }
+
+                container.innerHTML = rows.map((row) => {
+                    const enabled = !!row.enabled;
+                    const availableNow = !!row.available;
+                    const cooldownSeconds = Number(row.cooldown_seconds || 0);
+                    let statusText = '不可用';
+                    let statusClass = 'offline';
+                    if (enabled && availableNow) {
+                        statusText = '可用';
+                        statusClass = 'ok';
+                    } else if (enabled && cooldownSeconds > 0) {
+                        statusText = `冷却 ${cooldownSeconds}s`;
+                        statusClass = 'cooldown';
+                    }
+
+                    const accountId = escapeHtml(String(row.account_id || 'unknown'));
+                    const weight = Number(row.weight || 1);
+                    const selectedCount = Number(row.selected_count || 0);
+                    const failureCount = Number(row.failure_count || 0);
+                    const fileName = escapeHtml(String(row.file || ''));
+                    const errText = row.last_error ? `<div class="account-error">${escapeHtml(String(row.last_error))}</div>` : '';
+
+                    return `
+                        <div class="account-item">
+                            <div class="account-head">
+                                <div class="account-id">${accountId}</div>
+                                <span class="account-status ${statusClass}">${statusText}</span>
+                            </div>
+                            <div class="account-meta">
+                                <span>weight: ${weight}</span>
+                                <span>selected: ${selectedCount}</span>
+                                <span>failures: ${failureCount}</span>
+                                <span>file: ${fileName || '-'}</span>
+                            </div>
+                            ${errText}
+                        </div>
+                    `;
+                }).join('');
+            } catch (e) {
+                console.error("Failed to refresh accounts", e);
+                container.innerHTML = `<div class="empty-state" style="color:var(--danger)">账号池加载失败: ${escapeHtml(e.message || String(e))}</div>`;
+            }
+        }
+
         async function refresh() {
-            await Promise.all([refreshStats(), refreshLogs()]);
+            await Promise.all([refreshStats(), refreshLogs(), refreshAccounts()]);
         }
 
         async function clearLogs() {
@@ -764,8 +910,9 @@ async def admin_page():
         // Init
         refresh();
         loadModels();
-        // 仅自动刷新统计，不自动刷新日志，避免展开详情被打断
+        // 仅自动刷新统计与账号池，不自动刷新日志，避免展开详情被打断
         setInterval(refreshStats, 3000);
+        setInterval(refreshAccounts, 3000);
     </script>
 </body>
 </html>"""
@@ -799,6 +946,12 @@ async def get_sysinfo():
         "uptime": uptime_str,
         "pid": os.getpid()
     }
+
+
+@app.get("/admin/accounts")
+async def get_accounts():
+    proxy = get_proxy()
+    return await proxy.get_account_pool_status()
 
 @app.get("/health")
 @app.get("/v1/health")

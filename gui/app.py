@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QFrame, QGridLayout,
     QProgressBar, QSizePolicy, QScrollArea, QTextEdit,
     QGraphicsDropShadowEffect, QDialog, QCheckBox, QMessageBox,
-    QSystemTrayIcon, QMenu, QAction
+    QSystemTrayIcon, QMenu, QAction, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtCore import (
     Qt, QTimer, QSize, pyqtSignal, pyqtSlot, QThread, QPoint, QSettings, QLockFile
@@ -13,12 +13,14 @@ from PyQt5.QtGui import QFont, QColor, QPainter, QIntValidator, QCursor, QIcon
 import sys
 import threading
 import asyncio
+import json
 import uvicorn
 import webbrowser
 import platform
 import psutil
 import os
 import time
+import re
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -206,6 +208,31 @@ class Styles:
         selection-color: #111111;
     }
 
+    QTableWidget {
+        background-color: #0a0a0a;
+        alternate-background-color: #120a06;
+        color: #ff9966;
+        border: 1px solid #ff5500;
+        border-radius: 6px;
+        gridline-color: #2d1808;
+        selection-background-color: #2a1408;
+        selection-color: #ffbb88;
+        font-size: 12px;
+    }
+
+    QHeaderView::section {
+        background-color: #130903;
+        color: #ffbb88;
+        border: 1px solid #2d1808;
+        padding: 4px 6px;
+        font-weight: bold;
+    }
+
+    QTableCornerButton::section {
+        background-color: #130903;
+        border: 1px solid #2d1808;
+    }
+
     /* Log Area */
     QFrame.LogArea {
         background-color: #000000;
@@ -381,6 +408,159 @@ class ServerManager:
         """服务器停止回调"""
         self.is_running = False
 
+
+class AccountPoolDialog(QDialog):
+    """账号池健康检查对话框"""
+
+    pool_loaded = pyqtSignal(object)
+    pool_failed = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget, fetch_payload):
+        super().__init__(parent)
+        self.fetch_payload = fetch_payload
+        self._loading = False
+        self.pool_loaded.connect(self._on_pool_loaded)
+        self.pool_failed.connect(self._on_pool_failed)
+        self._build_ui()
+
+    def _build_ui(self):
+        self.setWindowTitle("账号池健康检查")
+        self.resize(980, 560)
+        self.setStyleSheet(Styles.get_style())
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(8)
+
+        toolbar = QHBoxLayout()
+        self.summary_label = QLabel("点击刷新查看账号池状态")
+        self.summary_label.setStyleSheet("color: #bbbbbb; font-size: 12px;")
+        self.summary_label.setWordWrap(True)
+
+        self.btn_refresh = QPushButton("刷新状态")
+        self.btn_refresh.setProperty("class", "ActionBtn")
+        self.btn_refresh.clicked.connect(self.refresh_pool)
+
+        toolbar.addWidget(self.summary_label, 1)
+        toolbar.addWidget(self.btn_refresh, 0)
+        root_layout.addLayout(toolbar)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(9)
+        self.table.setHorizontalHeaderLabels([
+            "账号 ID",
+            "健康状态",
+            "启用",
+            "权重",
+            "已选次数",
+            "失败次数",
+            "冷却(s)",
+            "凭证文件",
+            "错误信息",
+        ])
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Stretch)
+        root_layout.addWidget(self.table, 1)
+
+    def refresh_pool(self):
+        if self._loading:
+            return
+        self._set_loading(True)
+        threading.Thread(target=self._load_worker, daemon=True).start()
+
+    def _set_loading(self, loading: bool):
+        self._loading = loading
+        self.btn_refresh.setEnabled(not loading)
+        self.btn_refresh.setText("刷新中..." if loading else "刷新状态")
+        if loading:
+            self.summary_label.setText("正在获取账号池状态，请稍候...")
+
+    def _load_worker(self):
+        try:
+            payload = self.fetch_payload()
+            self.pool_loaded.emit(payload)
+        except Exception as e:
+            self.pool_failed.emit(str(e))
+
+    def _safe_int(self, value: object, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def _resolve_health_status(self, row: Dict[str, object]):
+        enabled = bool(row.get("enabled"))
+        available = bool(row.get("available"))
+        cooldown = self._safe_int(row.get("cooldown_seconds"), 0)
+        if enabled and available:
+            return "可用", QColor("#34d399")
+        if enabled and cooldown > 0:
+            return f"冷却 {cooldown}s", QColor("#f59e0b")
+        if enabled:
+            return "不可用", QColor("#ff6b6b")
+        return "禁用", QColor("#888888")
+
+    @pyqtSlot(object)
+    def _on_pool_loaded(self, payload: object):
+        self._set_loading(False)
+        if not isinstance(payload, dict):
+            self.summary_label.setText("账号池状态格式错误：返回值不是 JSON 对象")
+            return
+
+        mode = str(payload.get("mode") or "-")
+        total = self._safe_int(payload.get("total_accounts"), 0)
+        available = self._safe_int(payload.get("available_accounts"), 0)
+        creds_dir = str(payload.get("creds_dir") or "-")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.summary_label.setText(
+            f"模式：{mode}    可用：{available}/{total}    凭证目录：{creds_dir}    更新时间：{ts}"
+        )
+
+        rows = payload.get("accounts")
+        if not isinstance(rows, list):
+            rows = []
+
+        self.table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                row = {}
+            status_text, status_color = self._resolve_health_status(row)
+            values = [
+                str(row.get("account_id") or "unknown"),
+                status_text,
+                "是" if bool(row.get("enabled")) else "否",
+                str(self._safe_int(row.get("weight"), 1)),
+                str(self._safe_int(row.get("selected_count"), 0)),
+                str(self._safe_int(row.get("failure_count"), 0)),
+                str(self._safe_int(row.get("cooldown_seconds"), 0)),
+                str(row.get("file") or "-"),
+                str(row.get("last_error") or ""),
+            ]
+
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 1:
+                    item.setForeground(status_color)
+                if col == 8 and value:
+                    item.setToolTip(value)
+                self.table.setItem(row_index, col, item)
+
+    @pyqtSlot(str)
+    def _on_pool_failed(self, error_message: str):
+        self._set_loading(False)
+        self.summary_label.setText(f"账号池状态获取失败：{error_message}")
+
+
 # ==============================
 # 主窗口（核心优化）
 # ==============================
@@ -395,6 +575,7 @@ class MainWindow(QMainWindow):
         self.current_port = DEFAULT_PORT
         self.settings = QSettings(APP_ID, "Console")
         self.tray_icon = None
+        self.account_pool_dialog: Optional[AccountPoolDialog] = None
         self._allow_close = False
         self.log_signal.connect(self.update_log)
         self.init_ui()
@@ -612,13 +793,13 @@ class MainWindow(QMainWindow):
         self.btn_clear.clicked.connect(self.clear_logs)
         self.btn_clear.setProperty("class", "ActionBtn")
 
-        self.btn_oauth = QPushButton("OAuth认证")
-        self.btn_oauth.clicked.connect(self.start_oauth)
-        self.btn_oauth.setProperty("class", "ActionBtn")
+        self.btn_add_account = QPushButton("账号添加")
+        self.btn_add_account.clicked.connect(self.add_account)
+        self.btn_add_account.setProperty("class", "ActionBtn")
 
-        self.btn_health = QPushButton("健康检查")
-        self.btn_health.clicked.connect(self.check_health)
-        self.btn_health.setProperty("class", "ActionBtn")
+        self.btn_account_pool = QPushButton("账号池")
+        self.btn_account_pool.clicked.connect(self.check_account_pool)
+        self.btn_account_pool.setProperty("class", "ActionBtn")
 
         self.btn_sysinfo = QPushButton("模型列表")
         self.btn_sysinfo.clicked.connect(self.show_system_info)
@@ -636,8 +817,8 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.btn_start, 0, 0)
         btn_layout.addWidget(self.btn_admin, 0, 1)
         btn_layout.addWidget(self.btn_clear, 0, 2)
-        btn_layout.addWidget(self.btn_oauth, 0, 3)
-        btn_layout.addWidget(self.btn_health, 1, 0)
+        btn_layout.addWidget(self.btn_add_account, 0, 3)
+        btn_layout.addWidget(self.btn_account_pool, 1, 0)
         btn_layout.addWidget(self.btn_sysinfo, 1, 1)
         btn_layout.addWidget(self.btn_api, 1, 2)
         btn_layout.addWidget(self.btn_github, 1, 3)
@@ -941,56 +1122,104 @@ class MainWindow(QMainWindow):
         self.update_log("日志已清空 / Logs cleared", level="info")
 
     @pyqtSlot()
-    def start_oauth(self):
-        """启动 OAuth 认证"""
-        self.log_signal.emit("正在启动 OAuth 认证...")
+    def add_account(self):
+        """通过 OAuth 添加账号并写入凭证池"""
+        self.log_signal.emit("正在启动账号添加（OAuth 授权）...")
         try:
             from iflow_oauth import start_oauth_flow
-            import asyncio
 
             def run_oauth():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
                 try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-
                     def open_browser(url):
-                        self.log_signal.emit("正在打开浏览器进行授权...")
+                        self.log_signal.emit("正在打开浏览器进行账号授权...")
                         webbrowser.open(url)
 
                     credentials = loop.run_until_complete(start_oauth_flow(on_auth_url=open_browser))
-                    self.log_signal.emit(f"✓ OAuth 认证成功！API Key: {credentials['apiKey'][:20]}...")
+                    account_id, saved_path = self._save_account_to_pool(credentials)
+                    self.log_signal.emit(f"✓ 账号添加成功：{account_id}")
+                    self.log_signal.emit(f"凭证文件已写入：{saved_path}")
                 except Exception as e:
-                    self.log_signal.emit(f"✗ OAuth 认证失败: {e}")
+                    self.log_signal.emit(f"✗ 账号添加失败: {e}")
+                finally:
+                    loop.close()
+                    asyncio.set_event_loop(None)
 
             threading.Thread(target=run_oauth, daemon=True).start()
         except Exception as e:
-            self.log_signal.emit(f"启动 OAuth 失败: {e}")
+            self.log_signal.emit(f"启动账号添加失败: {e}")
 
     @pyqtSlot()
-    def check_health(self):
-        """检查服务健康状态"""
-        if not self.server_manager.is_running:
-            self.log_signal.emit("服务未运行，无法检查健康状态")
-            return
+    def check_account_pool(self):
+        """打开账号池健康检查窗口"""
+        if self.account_pool_dialog is None:
+            self.account_pool_dialog = AccountPoolDialog(self, self._fetch_account_pool_payload)
+        self.account_pool_dialog.show()
+        self.account_pool_dialog.raise_()
+        self.account_pool_dialog.activateWindow()
+        self.account_pool_dialog.refresh_pool()
+        self.log_signal.emit("已打开账号池健康检查窗口")
 
+    def _fetch_account_pool_payload(self) -> Dict[str, object]:
+        import httpx
+
+        if self.server_manager.is_running:
+            response = httpx.get(f"http://localhost:{self.current_port}/admin/accounts", timeout=8.0)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("账号池接口返回格式错误")
+            return payload
+
+        proxy = get_proxy()
+        loop = asyncio.new_event_loop()
         try:
-            import httpx
-            port = self.current_port
+            asyncio.set_event_loop(loop)
+            payload = loop.run_until_complete(proxy.get_account_pool_status())
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
 
-            def check():
-                try:
-                    response = httpx.get(f"http://localhost:{port}/health", timeout=5.0)
-                    if response.status_code == 200:
-                        data = response.json()
-                        self.log_signal.emit(f"✓ 健康检查通过: {data.get('status', 'ok')}")
-                    else:
-                        self.log_signal.emit(f"✗ 健康检查失败: HTTP {response.status_code}")
-                except Exception as e:
-                    self.log_signal.emit(f"✗ 健康检查失败: {e}")
+        if not isinstance(payload, dict):
+            raise ValueError("账号池数据返回格式错误")
+        return payload
 
-            threading.Thread(target=check, daemon=True).start()
-        except Exception as e:
-            self.log_signal.emit(f"健康检查错误: {e}")
+    def _resolve_creds_dir(self) -> Path:
+        configured = ""
+        if isinstance(CONFIG, dict):
+            configured = str(CONFIG.get("creds_dir") or "").strip()
+        if not configured:
+            configured = str(Path.home() / ".iflow2api" / "creds")
+        return Path(configured).expanduser()
+
+    def _save_account_to_pool(self, credentials: Dict[str, object]):
+        api_key = str(credentials.get("apiKey") or "").strip()
+        if not api_key:
+            raise ValueError("未获取到 apiKey，无法写入账号池")
+
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix = re.sub(r"[^A-Za-z0-9]", "", api_key[-6:]).lower() or "acct"
+        account_id_base = f"acct_{now}_{suffix}"
+
+        creds_dir = self._resolve_creds_dir()
+        creds_dir.mkdir(parents=True, exist_ok=True)
+
+        account_id = account_id_base
+        file_path = creds_dir / f"{account_id}.json"
+        idx = 1
+        while file_path.exists():
+            account_id = f"{account_id_base}_{idx}"
+            file_path = creds_dir / f"{account_id}.json"
+            idx += 1
+
+        payload = dict(credentials)
+        payload["account_id"] = account_id
+        payload["enabled"] = True
+        payload["weight"] = int(payload.get("weight") or 1)
+        file_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        return account_id, str(file_path)
 
     @pyqtSlot()
     def show_system_info(self):

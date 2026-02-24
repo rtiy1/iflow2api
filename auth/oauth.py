@@ -194,7 +194,7 @@ async def start_oauth_flow(save_path: Optional[str] = None, on_auth_url=None) ->
 
     # 保存凭据
     if save_path is None:
-        save_path = Path.home() / ".iflow" / "oauth_creds.json"
+        save_path = Path.home() / ".iflow2api" / "oauth_creds.json"
     else:
         save_path = Path(save_path)
 

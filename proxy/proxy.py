@@ -14,6 +14,8 @@ import re
 import time
 import uuid
 import copy
+from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import unquote
 from typing import AsyncIterator, Optional, Dict, Any, List, Tuple
 
@@ -43,6 +45,10 @@ EXTRA_MODELS = [
     "kimi-k2.5",
     "iflow-rome-30ba3b",
 ]
+
+CREDENTIAL_POOL_RELOAD_INTERVAL = 5.0
+ACCOUNT_COOLDOWN_BASE_SECONDS = 30.0
+ACCOUNT_COOLDOWN_MAX_SECONDS = 300.0
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -313,6 +319,45 @@ def _extract_iflow_request_ids(body: Dict[str, Any]) -> Tuple[str, str]:
         session_id = f"session-{uuid.uuid4()}"
 
     return session_id, conversation_id
+
+
+def _parse_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _parse_positive_int(value: Any, default: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
+
+
+@dataclass
+class CredentialAccount:
+    account_id: str
+    api_key: str
+    file_path: str = ""
+    enabled: bool = True
+    weight: int = 1
+    token_storage: Optional[IFlowTokenStorage] = None
+    cooldown_until: float = 0.0
+    failure_count: int = 0
+    last_error: str = ""
+    selected_count: int = 0
+    last_selected_at: float = 0.0
+    last_success_at: float = 0.0
+
+    def is_available(self, now_ts: float) -> bool:
+        return self.enabled and bool(self.api_key) and now_ts >= self.cooldown_until
 
 
 def _create_iflow_signature(user_agent: str, session_id: str, timestamp_ms: int, api_key: str) -> str:
@@ -751,30 +796,48 @@ def get_default_system_prompt() -> str:
 
 class ReverseProxy:
 
-    def __init__(self, upstream_url: str, api_key: str, token_file_path: Optional[str] = None):
+    def __init__(
+        self,
+        upstream_url: str,
+        api_key: str,
+        token_file_path: Optional[str] = None,
+        creds_dir: Optional[str] = None,
+    ):
         self.upstream_url = upstream_url.rstrip("/")
         self.api_key = api_key
         self.token_file_path = token_file_path
+        self.creds_dir = creds_dir
         self.token_storage: Optional[IFlowTokenStorage] = None
         self._client: Optional[httpx.AsyncClient] = None
+        self._single_refresh_lock = asyncio.Lock()
+        self._pool_lock = asyncio.Lock()
+        self._account_refresh_locks: Dict[str, asyncio.Lock] = {}
+        self._accounts: Dict[str, CredentialAccount] = {}
+        self._account_order: List[str] = []
+        self._rr_cursor = 0
+        self._pool_last_loaded_at = 0.0
 
     async def initialize(self):
         """初始化并刷新 token（如需要）"""
-        if self.token_file_path:
+        if not self.token_file_path:
+            return
+        async with self._single_refresh_lock:
             self.token_storage = await load_token_from_file(self.token_file_path)
-            if self.token_storage:
-                if self.token_storage.is_expired() and self.token_storage.refresh_token:
-                    logger.info("[iFlow] Token expired or near expiry, refreshing...")
-                    try:
-                        refreshed = await refresh_oauth_tokens(self.token_storage.refresh_token)
-                        self.token_storage = IFlowTokenStorage(refreshed)
-                        await save_token_to_file(self.token_file_path, self.token_storage)
-                        logger.info("[iFlow] Token refreshed and saved")
-                    except Exception as e:
-                        logger.warning(f"[iFlow] Token refresh failed: {e}")
+            if not self.token_storage:
+                return
 
-                if self.token_storage.api_key:
-                    self.api_key = self.token_storage.api_key
+            if self.token_storage.is_expired() and self.token_storage.refresh_token:
+                logger.info("[iFlow] Token expired or near expiry, refreshing...")
+                try:
+                    refreshed = await refresh_oauth_tokens(self.token_storage.refresh_token)
+                    self.token_storage = IFlowTokenStorage(refreshed)
+                    await save_token_to_file(self.token_file_path, self.token_storage)
+                    logger.info("[iFlow] Token refreshed and saved")
+                except Exception as e:
+                    logger.warning(f"[iFlow] Token refresh failed: {e}")
+
+            if self.token_storage.api_key:
+                self.api_key = self.token_storage.api_key
 
     async def _get_client(self) -> httpx.AsyncClient:
         """获取HTTP客户端"""
@@ -790,9 +853,299 @@ class ReverseProxy:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
-    def _director(self, headers: Dict[str, str]) -> Dict[str, str]:
+    def _credential_dir_path(self) -> Optional[Path]:
+        if not self.creds_dir:
+            return None
+        try:
+            return Path(self.creds_dir).expanduser()
+        except Exception:
+            return None
+
+    def _iter_credential_files(self, root: Path) -> List[Path]:
+        if root is None or not root.exists() or not root.is_dir():
+            return []
+        files = []
+        for path in sorted(root.glob("*.json")):
+            if path.name.lower() == "index.json":
+                continue
+            files.append(path)
+        return files
+
+    def _load_credential_account(self, file_path: Path) -> Optional[CredentialAccount]:
+        try:
+            raw = json.loads(file_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(f"[iFlow] 读取凭证文件失败: {file_path} ({exc})")
+            return None
+        if not isinstance(raw, dict):
+            return None
+
+        account_id = str(raw.get("account_id") or raw.get("id") or file_path.stem).strip()
+        api_key = str(raw.get("apiKey") or raw.get("api_key") or "").strip()
+        if not account_id or not api_key:
+            logger.warning(f"[iFlow] 跳过无效凭证文件: {file_path}")
+            return None
+
+        if "apiKey" not in raw and api_key:
+            raw["apiKey"] = api_key
+        token_storage = IFlowTokenStorage(raw)
+        enabled = _parse_bool(raw.get("enabled"), default=True)
+        weight = _parse_positive_int(raw.get("weight"), default=1)
+        return CredentialAccount(
+            account_id=account_id,
+            api_key=api_key,
+            file_path=str(file_path),
+            enabled=enabled,
+            weight=weight,
+            token_storage=token_storage,
+        )
+
+    async def _reload_account_pool_if_needed(self, force: bool = False) -> bool:
+        root = self._credential_dir_path()
+        if root is None:
+            return False
+
+        now_ts = time.time()
+        async with self._pool_lock:
+            if not force and (now_ts - self._pool_last_loaded_at) < CREDENTIAL_POOL_RELOAD_INTERVAL:
+                return len(self._account_order) > 0
+
+            files = self._iter_credential_files(root)
+            if not files:
+                self._accounts = {}
+                self._account_order = []
+                self._pool_last_loaded_at = now_ts
+                return False
+
+            old_accounts = self._accounts
+            new_accounts: Dict[str, CredentialAccount] = {}
+            for file_path in files:
+                account = self._load_credential_account(file_path)
+                if account is None:
+                    continue
+                old = old_accounts.get(account.account_id)
+                if old is not None:
+                    account.cooldown_until = old.cooldown_until
+                    account.failure_count = old.failure_count
+                    account.last_error = old.last_error
+                    account.selected_count = old.selected_count
+                    account.last_selected_at = old.last_selected_at
+                    account.last_success_at = old.last_success_at
+                new_accounts[account.account_id] = account
+                if account.account_id not in self._account_refresh_locks:
+                    self._account_refresh_locks[account.account_id] = asyncio.Lock()
+
+            self._accounts = new_accounts
+            self._account_order = sorted(new_accounts.keys())
+            self._pool_last_loaded_at = now_ts
+            if self._rr_cursor >= len(self._account_order):
+                self._rr_cursor = 0
+            return len(self._account_order) > 0
+
+    async def _get_available_pool_account_id(self) -> Optional[str]:
+        async with self._pool_lock:
+            if not self._account_order:
+                return None
+            now_ts = time.time()
+            weighted_ids: List[str] = []
+            for account_id in self._account_order:
+                account = self._accounts.get(account_id)
+                if account is None or not account.is_available(now_ts):
+                    continue
+                repeat = min(max(1, account.weight), 100)
+                weighted_ids.extend([account_id] * repeat)
+            if not weighted_ids:
+                return None
+            index = self._rr_cursor % len(weighted_ids)
+            self._rr_cursor = (self._rr_cursor + 1) % max(len(weighted_ids), 1)
+            selected_id = weighted_ids[index]
+            account = self._accounts.get(selected_id)
+            if account is not None:
+                account.selected_count += 1
+                account.last_selected_at = now_ts
+            return selected_id
+
+    async def _ensure_pool_account_fresh(self, account_id: str) -> Optional[CredentialAccount]:
+        async with self._pool_lock:
+            account = self._accounts.get(account_id)
+            if account is None:
+                return None
+            refresh_lock = self._account_refresh_locks.setdefault(account_id, asyncio.Lock())
+
+        if (
+            account.token_storage is None
+            or not account.token_storage.refresh_token
+            or not account.token_storage.is_expired()
+        ):
+            return copy.deepcopy(account)
+
+        async with refresh_lock:
+            async with self._pool_lock:
+                account = self._accounts.get(account_id)
+                if account is None:
+                    return None
+                if (
+                    account.token_storage is None
+                    or not account.token_storage.refresh_token
+                    or not account.token_storage.is_expired()
+                ):
+                    return copy.deepcopy(account)
+                file_path = account.file_path
+                refresh_token = account.token_storage.refresh_token
+
+            if file_path:
+                latest = await load_token_from_file(file_path)
+                if latest is not None and not latest.is_expired():
+                    async with self._pool_lock:
+                        current = self._accounts.get(account_id)
+                        if current is not None:
+                            current.token_storage = latest
+                            if latest.api_key:
+                                current.api_key = latest.api_key
+                                current.failure_count = 0
+                                current.cooldown_until = 0.0
+                                current.last_error = ""
+                            return copy.deepcopy(current)
+
+            try:
+                refreshed = await refresh_oauth_tokens(refresh_token)
+                refreshed_storage = IFlowTokenStorage(refreshed)
+                if file_path:
+                    await save_token_to_file(file_path, refreshed_storage)
+            except Exception as exc:
+                logger.warning(f"[iFlow] 刷新账号凭证失败 ({account_id}): {exc}")
+                async with self._pool_lock:
+                    current = self._accounts.get(account_id)
+                    if current is not None:
+                        current.last_error = str(exc)
+                        current.cooldown_until = max(current.cooldown_until, time.time() + ACCOUNT_COOLDOWN_BASE_SECONDS)
+                        return copy.deepcopy(current)
+                return None
+
+            async with self._pool_lock:
+                current = self._accounts.get(account_id)
+                if current is None:
+                    return None
+                current.token_storage = refreshed_storage
+                if refreshed_storage.api_key:
+                    current.api_key = refreshed_storage.api_key
+                current.failure_count = 0
+                current.cooldown_until = 0.0
+                current.last_error = ""
+                return copy.deepcopy(current)
+
+    async def _select_account(self) -> CredentialAccount:
+        has_pool = await self._reload_account_pool_if_needed()
+        if has_pool:
+            account_id = await self._get_available_pool_account_id()
+            if account_id is None:
+                raise RuntimeError("no credential available")
+            account = await self._ensure_pool_account_fresh(account_id)
+            if account is not None and account.api_key:
+                return account
+            raise RuntimeError("credential refresh failed")
+
+        await self.initialize()
+        return CredentialAccount(
+            account_id="default",
+            api_key=self.api_key,
+            file_path=self.token_file_path or "",
+            token_storage=self.token_storage,
+            enabled=True,
+        )
+
+    async def _mark_account_success(self, account_id: str):
+        if not account_id or account_id == "default":
+            return
+        async with self._pool_lock:
+            account = self._accounts.get(account_id)
+            if account is None:
+                return
+            account.failure_count = 0
+            account.cooldown_until = 0.0
+            account.last_error = ""
+            account.last_success_at = time.time()
+
+    async def _mark_account_failure(self, account_id: str, status_code: Optional[int], err_msg: str = ""):
+        if not account_id or account_id == "default":
+            return
+        async with self._pool_lock:
+            account = self._accounts.get(account_id)
+            if account is None:
+                return
+
+            account.failure_count += 1
+            level = max(0, account.failure_count - 1)
+            cooldown_seconds = 0.0
+            if status_code in {429, 503, 408, 500, 502, 504}:
+                cooldown_seconds = min(ACCOUNT_COOLDOWN_BASE_SECONDS * (2 ** level), ACCOUNT_COOLDOWN_MAX_SECONDS)
+            elif status_code in {401, 403}:
+                cooldown_seconds = ACCOUNT_COOLDOWN_MAX_SECONDS
+
+            if cooldown_seconds > 0:
+                account.cooldown_until = time.time() + cooldown_seconds
+            account.last_error = err_msg[:400] if err_msg else ""
+
+    async def get_account_pool_status(self) -> Dict[str, Any]:
+        has_pool = await self._reload_account_pool_if_needed(force=True)
+        if not has_pool:
+            return {
+                "mode": "single",
+                "creds_dir": self.creds_dir or "",
+                "total_accounts": 1 if self.api_key else 0,
+                "available_accounts": 1 if self.api_key else 0,
+                "accounts": [
+                    {
+                        "account_id": "default",
+                        "enabled": bool(self.api_key),
+                        "available": bool(self.api_key),
+                        "weight": 1,
+                        "failure_count": 0,
+                        "cooldown_seconds": 0,
+                        "last_error": "",
+                        "file": os.path.basename(self.token_file_path) if self.token_file_path else "",
+                    }
+                ],
+            }
+
+        async with self._pool_lock:
+            now_ts = time.time()
+            accounts_payload: List[Dict[str, Any]] = []
+            for account_id in self._account_order:
+                account = self._accounts.get(account_id)
+                if account is None:
+                    continue
+                cooldown_seconds = max(0, int(account.cooldown_until - now_ts))
+                accounts_payload.append(
+                    {
+                        "account_id": account.account_id,
+                        "enabled": account.enabled,
+                        "available": account.is_available(now_ts),
+                        "weight": account.weight,
+                        "failure_count": account.failure_count,
+                        "cooldown_seconds": cooldown_seconds,
+                        "selected_count": account.selected_count,
+                        "last_selected_at": int(account.last_selected_at) if account.last_selected_at else 0,
+                        "last_success_at": int(account.last_success_at) if account.last_success_at else 0,
+                        "last_error": account.last_error,
+                        "file": os.path.basename(account.file_path) if account.file_path else "",
+                    }
+                )
+
+            available_count = sum(1 for row in accounts_payload if row["available"])
+            return {
+                "mode": "pool",
+                "creds_dir": self.creds_dir or "",
+                "total_accounts": len(accounts_payload),
+                "available_accounts": available_count,
+                "cursor": self._rr_cursor,
+                "accounts": accounts_payload,
+            }
+
+    def _director(self, headers: Dict[str, str], api_key: Optional[str] = None) -> Dict[str, str]:
 
         modified = headers.copy()
+        key = (api_key or self.api_key or "").strip()
 
         modified.pop("authorization", None)
         modified.pop("x-api-key", None)
@@ -801,8 +1154,8 @@ class ReverseProxy:
         modified.pop("x-iflow-signature", None)
         modified.pop("session-id", None)
 
-        modified["x-api-key"] = self.api_key
-        modified["authorization"] = f"Bearer {self.api_key}"
+        modified["x-api-key"] = key
+        modified["authorization"] = f"Bearer {key}"
         modified["user-agent"] = IFLOW_CLI_USER_AGENT
         modified["content-type"] = "application/json"
 
@@ -815,9 +1168,11 @@ class ReverseProxy:
         with_signature: bool = True,
         session_id: Optional[str] = None,
         conversation_id: str = "",
+        api_key: Optional[str] = None,
     ) -> Dict[str, str]:
 
         modified = headers.copy()
+        key = (api_key or self.api_key or "").strip()
         if not session_id:
             session_id = f"session-{uuid.uuid4()}"
 
@@ -830,7 +1185,7 @@ class ReverseProxy:
         if with_signature:
             timestamp_ms = int(time.time() * 1000)
             modified["x-iflow-timestamp"] = str(timestamp_ms)
-            signature = _create_iflow_signature(IFLOW_CLI_USER_AGENT, session_id, timestamp_ms, self.api_key)
+            signature = _create_iflow_signature(IFLOW_CLI_USER_AGENT, session_id, timestamp_ms, key)
             if signature:
                 modified["x-iflow-signature"] = signature
             else:
@@ -909,21 +1264,28 @@ class ReverseProxy:
 
     async def proxy_request(self, endpoint: str, body: Dict[str, Any], model: str, stream: bool = False):
         """代理请求"""
-        await self.initialize()
-
         effective_model = model
         has_images = _request_has_images(body)
         working_body = body
 
-        headers = self._director({})
         client = await self._get_client()
+        try:
+            account = await self._select_account()
+        except RuntimeError as exc:
+            request = client.build_request("POST", f"{self.upstream_url}{endpoint}", json=body)
+            raise _build_http_status_error(503, str(exc), request)
+        if not account.api_key:
+            request = client.build_request("POST", f"{self.upstream_url}{endpoint}", json=body)
+            raise _build_http_status_error(503, "No credential available", request)
+        headers = self._director({}, api_key=account.api_key)
+        logger.debug(f"[iFlow] 使用账号 {account.account_id} 处理请求 model={model}")
 
         if has_images:
             if _should_force_vision_for_series(model):
                 if _forced_model_is_multimodal():
                     logger.info(f"[iFlow] 检测到图片输入，模型属于两段式处理系列: {model} -> {FORCED_VISION_MODEL} -> {model}")
                     try:
-                        vision_summary = await self._generate_vision_summary(client, headers, endpoint, body, model)
+                        vision_summary = await self._generate_vision_summary(client, headers, endpoint, body, model, account)
                         if vision_summary:
                             logger.info(f"[iFlow] 视觉解析完成，摘要长度: {len(vision_summary)}")
                             working_body = self._build_two_stage_main_body(body, vision_summary)
@@ -942,9 +1304,25 @@ class ReverseProxy:
         processed_body = self._modify_request_body(working_body, effective_model)
 
         if stream:
-            return self._proxy_stream(client, endpoint, headers, processed_body, model=effective_model, has_images=has_images)
+            return self._proxy_stream(
+                client,
+                endpoint,
+                headers,
+                processed_body,
+                model=effective_model,
+                has_images=has_images,
+                account=account,
+            )
         else:
-            return await self._proxy_non_stream(client, endpoint, headers, processed_body, model=effective_model, has_images=has_images)
+            return await self._proxy_non_stream(
+                client,
+                endpoint,
+                headers,
+                processed_body,
+                model=effective_model,
+                has_images=has_images,
+                account=account,
+            )
 
     async def _generate_vision_summary(
         self,
@@ -953,6 +1331,7 @@ class ReverseProxy:
         endpoint: str,
         body: Dict[str, Any],
         model: str,
+        account: CredentialAccount,
     ) -> str:
         vision_body = copy.deepcopy(body)
         vision_body["stream"] = False
@@ -983,6 +1362,7 @@ class ReverseProxy:
             model=FORCED_VISION_MODEL,
             has_images=True,
             allow_vision_fallback=False,
+            account=account,
         )
         return _extract_text_from_result(result)
 
@@ -1014,6 +1394,7 @@ class ReverseProxy:
         model: str,
         has_images: bool,
         allow_vision_fallback: bool = True,
+        account: CredentialAccount,
     ):
         """非流式代理 - 带重试"""
         last_error = None
@@ -1026,6 +1407,7 @@ class ReverseProxy:
                     with_signature=True,
                     session_id=session_id,
                     conversation_id=conversation_id,
+                    api_key=account.api_key,
                 )
                 response = await client.post(
                     f"{self.upstream_url}{endpoint}",
@@ -1039,6 +1421,7 @@ class ReverseProxy:
                         with_signature=False,
                         session_id=session_id,
                         conversation_id=conversation_id,
+                        api_key=account.api_key,
                     )
                     response = await client.post(
                         f"{self.upstream_url}{endpoint}",
@@ -1072,6 +1455,7 @@ class ReverseProxy:
                         "total_tokens": prompt_tokens + completion_tokens,
                     }
 
+                await self._mark_account_success(account.account_id)
                 return result
             except httpx.HTTPStatusError as e:
                 if allow_vision_fallback and _should_fallback_to_forced_vision(e, model=model, has_images=has_images):
@@ -1086,11 +1470,14 @@ class ReverseProxy:
                         model=FORCED_VISION_MODEL,
                         has_images=has_images,
                         allow_vision_fallback=False,
+                        account=account,
                     )
                 if getattr(e, "_iflow_business_error", False):
+                    await self._mark_account_failure(account.account_id, e.response.status_code, str(e))
                     raise
                 last_error = e
                 status_code = e.response.status_code
+                await self._mark_account_failure(account.account_id, status_code, str(e))
                 logger.warning(f"上游 API 错误 (尝试 {attempt + 1}/{MAX_RETRIES}): HTTP {status_code} - {e}")
                 if attempt < MAX_RETRIES - 1 and status_code not in non_retry_statuses:
                     await asyncio.sleep(RETRY_DELAY * (attempt + 1))
@@ -1098,6 +1485,7 @@ class ReverseProxy:
                     break
             except Exception as e:
                 last_error = e
+                await self._mark_account_failure(account.account_id, None, str(e))
                 logger.warning(f"请求失败 (尝试 {attempt + 1}/{MAX_RETRIES}): {e}")
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(RETRY_DELAY * (attempt + 1))
@@ -1119,6 +1507,7 @@ class ReverseProxy:
         model: str,
         has_images: bool,
         allow_vision_fallback: bool = True,
+        account: CredentialAccount,
     ) -> AsyncIterator[bytes]:
         session_id, conversation_id = _extract_iflow_request_ids(body)
         response: Optional[httpx.Response] = None
@@ -1129,6 +1518,7 @@ class ReverseProxy:
                 with_signature=with_signature,
                 session_id=session_id,
                 conversation_id=conversation_id,
+                api_key=account.api_key,
             )
             request = client.build_request(
                 "POST",
@@ -1222,6 +1612,7 @@ class ReverseProxy:
 
             if not saw_done:
                 yield b"data: [DONE]\n\n"
+            await self._mark_account_success(account.account_id)
         except httpx.HTTPStatusError as e:
             if allow_vision_fallback and _should_fallback_to_forced_vision(e, model=model, has_images=has_images):
                 logger.info(f"[iFlow] 原模型不支持图片输入，流式回退视觉模型: {model} -> {FORCED_VISION_MODEL}")
@@ -1235,12 +1626,15 @@ class ReverseProxy:
                     model=FORCED_VISION_MODEL,
                     has_images=has_images,
                     allow_vision_fallback=False,
+                    account=account,
                 ):
                     yield chunk
                 return
+            await self._mark_account_failure(account.account_id, e.response.status_code, str(e))
             logger.error(f"amp upstream proxy error for POST {endpoint}: {e}")
             raise
         except Exception as e:
+            await self._mark_account_failure(account.account_id, None, str(e))
             logger.error(f"amp upstream proxy error for POST {endpoint}: {e}")
             raise
         finally:
@@ -1249,13 +1643,19 @@ class ReverseProxy:
 
     async def get_models(self) -> Dict[str, Any]:
         """获取模型列表"""
-        await self.initialize()
-
-        headers = self._director({})
         client = await self._get_client()
+        try:
+            account = await self._select_account()
+        except RuntimeError as exc:
+            request = client.build_request("GET", f"{self.upstream_url}/models")
+            raise _build_http_status_error(503, str(exc), request)
+        if not account.api_key:
+            request = client.build_request("GET", f"{self.upstream_url}/models")
+            raise _build_http_status_error(503, "No credential available", request)
+        headers = self._director({}, api_key=account.api_key)
 
         try:
-            request_headers = self._apply_iflow_security_headers(headers)
+            request_headers = self._apply_iflow_security_headers(headers, api_key=account.api_key)
             response = await client.get(
                 f"{self.upstream_url}/models",
                 headers=request_headers
@@ -1264,8 +1664,11 @@ class ReverseProxy:
 
             response_headers = dict(response.headers)
             content = self._modify_response(response.content, response.status_code, response_headers)
+            await self._mark_account_success(account.account_id)
             return _append_extra_models(json.loads(content))
         except Exception as e:
+            status_code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
+            await self._mark_account_failure(account.account_id, status_code, str(e))
             logger.error(f"amp upstream proxy error for GET /models: {e}")
             raise
 
@@ -1279,5 +1682,6 @@ def get_proxy() -> ReverseProxy:
     global _proxy
     if _proxy is None:
         token_file = CONFIG.get("token_file_path")
-        _proxy = ReverseProxy(CONFIG["base_url"], CONFIG["api_key"], token_file)
+        creds_dir = CONFIG.get("creds_dir")
+        _proxy = ReverseProxy(CONFIG["base_url"], CONFIG["api_key"], token_file, creds_dir=creds_dir)
     return _proxy

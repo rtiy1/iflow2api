@@ -22,7 +22,7 @@ async def main():
         print("✓ 认证成功！")
         print("=" * 60)
         print(f"API Key: {credentials['apiKey'][:20]}...")
-        print(f"凭证已保存到: {Path.home() / '.iflow' / 'oauth_creds.json'}")
+        print(f"凭证已保存到: {Path.home() / '.iflow2api' / 'oauth_creds.json'}")
         print()
         print("现在可以启动 API 服务了：")
         print("  python main.py")
