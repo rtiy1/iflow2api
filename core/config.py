@@ -4,6 +4,7 @@ from typing import Optional
 
 DEFAULT_VISION_MODEL = "qwen3-vl-plus"
 DEFAULT_AUTO_VISION_MODEL = True
+DEFAULT_ROUTING_STRATEGY = "round-robin"
 APP_HOME_DIR = Path.home() / ".iflow2api"
 LEGACY_HOME_DIR = Path.home() / ".iflow"
 DEFAULT_CREDS_DIR = APP_HOME_DIR / "creds"
@@ -59,6 +60,7 @@ class IFlowConfig:
         vision_model: str = "",
         auto_vision_model: bool = False,
         allow_local_file_images: bool = False,
+        routing_strategy: str = DEFAULT_ROUTING_STRATEGY,
     ):
         self.api_key = api_key
         self.base_url = base_url
@@ -68,6 +70,7 @@ class IFlowConfig:
         self.vision_model = vision_model
         self.auto_vision_model = auto_vision_model
         self.allow_local_file_images = allow_local_file_images
+        self.routing_strategy = routing_strategy
 
 
 def load_iflow_config() -> IFlowConfig:
@@ -90,6 +93,7 @@ def load_iflow_config() -> IFlowConfig:
             allow_local_file_images = data.get("allowLocalFileImages")
             if allow_local_file_images is None:
                 allow_local_file_images = data.get("allow_local_file_images")
+            routing_strategy = data.get("routingStrategy") or data.get("routing_strategy") or DEFAULT_ROUTING_STRATEGY
             creds_dir = _resolve_creds_dir(data)
             if api_key:
                 print(f"[Config] Loaded OAuth credentials from {oauth_path}")
@@ -101,6 +105,7 @@ def load_iflow_config() -> IFlowConfig:
                     vision_model=vision_model,
                     auto_vision_model=bool(auto_vision_model),
                     allow_local_file_images=bool(allow_local_file_images),
+                    routing_strategy=routing_strategy,
                 )
         except Exception as e:
             print(f"[Config] Failed to load OAuth credentials: {e}")
@@ -124,6 +129,7 @@ def load_iflow_config() -> IFlowConfig:
         allow_local_file_images = data.get("allowLocalFileImages")
         if allow_local_file_images is None:
             allow_local_file_images = data.get("allow_local_file_images")
+        routing_strategy = data.get("routingStrategy") or data.get("routing_strategy") or DEFAULT_ROUTING_STRATEGY
         creds_dir = _resolve_creds_dir(data)
 
         if not api_key:
@@ -137,6 +143,7 @@ def load_iflow_config() -> IFlowConfig:
             vision_model=vision_model,
             auto_vision_model=bool(auto_vision_model),
             allow_local_file_images=bool(allow_local_file_images),
+            routing_strategy=routing_strategy,
         )
     except FileNotFoundError:
         raise FileNotFoundError("iFlow 配置文件不存在，请先运行 OAuth 认证或配置 API Key")
@@ -165,6 +172,7 @@ def load_config():
             "vision_model": config.vision_model,
             "auto_vision_model": config.auto_vision_model,
             "allow_local_file_images": config.allow_local_file_images,
+            "routing_strategy": config.routing_strategy,
         }
     except (FileNotFoundError, ValueError):
         return {
@@ -175,7 +183,8 @@ def load_config():
             "creds_dir": str(DEFAULT_CREDS_DIR),
             "vision_model": DEFAULT_VISION_MODEL,
             "auto_vision_model": DEFAULT_AUTO_VISION_MODEL,
-            "allow_local_file_images": False
+            "allow_local_file_images": False,
+            "routing_strategy": DEFAULT_ROUTING_STRATEGY,
         }
 
 

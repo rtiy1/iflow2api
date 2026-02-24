@@ -1,4 +1,4 @@
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Callable, Awaitable, Any
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QFrame, QGridLayout,
@@ -451,7 +451,7 @@ class AccountPoolDialog(QDialog):
             "账号 ID",
             "健康状态",
             "启用",
-            "权重",
+            "优先级",
             "已选次数",
             "失败次数",
             "冷却(s)",
@@ -518,12 +518,13 @@ class AccountPoolDialog(QDialog):
             return
 
         mode = str(payload.get("mode") or "-")
+        strategy = str(payload.get("routing_strategy") or "-")
         total = self._safe_int(payload.get("total_accounts"), 0)
         available = self._safe_int(payload.get("available_accounts"), 0)
         creds_dir = str(payload.get("creds_dir") or "-")
         ts = datetime.now().strftime("%H:%M:%S")
         self.summary_label.setText(
-            f"模式：{mode}    可用：{available}/{total}    凭证目录：{creds_dir}    更新时间：{ts}"
+            f"模式：{mode}    策略：{strategy}    可用：{available}/{total}    凭证目录：{creds_dir}    更新时间：{ts}"
         )
 
         rows = payload.get("accounts")
@@ -539,7 +540,7 @@ class AccountPoolDialog(QDialog):
                 str(row.get("account_id") or "unknown"),
                 status_text,
                 "是" if bool(row.get("enabled")) else "否",
-                str(self._safe_int(row.get("weight"), 1)),
+                str(self._safe_int(row.get("priority"), 0)),
                 str(self._safe_int(row.get("selected_count"), 0)),
                 str(self._safe_int(row.get("failure_count"), 0)),
                 str(self._safe_int(row.get("cooldown_seconds"), 0)),
@@ -576,6 +577,9 @@ class MainWindow(QMainWindow):
         self.settings = QSettings(APP_ID, "Console")
         self.tray_icon = None
         self.account_pool_dialog: Optional[AccountPoolDialog] = None
+        self._proxy_loop_ready = threading.Event()
+        self._proxy_loop_thread: Optional[threading.Thread] = None
+        self._proxy_loop: Optional[asyncio.AbstractEventLoop] = None
         self._allow_close = False
         self.log_signal.connect(self.update_log)
         self.init_ui()
@@ -679,6 +683,7 @@ class MainWindow(QMainWindow):
         if self._allow_close:
             self.server_manager.stop()
             self.timer.stop()
+            self._shutdown_proxy_loop()
             event.accept()
             return
         if self.tray_icon:
@@ -687,7 +692,80 @@ class MainWindow(QMainWindow):
             return
         self.server_manager.stop()
         self.timer.stop()
+        self._shutdown_proxy_loop()
         event.accept()
+
+    def _ensure_proxy_loop(self):
+        if (
+            self._proxy_loop is not None
+            and not self._proxy_loop.is_closed()
+            and self._proxy_loop_thread is not None
+            and self._proxy_loop_thread.is_alive()
+        ):
+            return
+
+        self._proxy_loop_ready.clear()
+        loop = asyncio.new_event_loop()
+        self._proxy_loop = loop
+
+        def loop_worker():
+            asyncio.set_event_loop(loop)
+            self._proxy_loop_ready.set()
+            loop.run_forever()
+
+        self._proxy_loop_thread = threading.Thread(target=loop_worker, daemon=True)
+        self._proxy_loop_thread.start()
+        if not self._proxy_loop_ready.wait(timeout=2.0):
+            raise RuntimeError("本地事件循环启动超时")
+
+    def _shutdown_proxy_loop(self):
+        loop = self._proxy_loop
+        thread = self._proxy_loop_thread
+        self._proxy_loop = None
+        self._proxy_loop_thread = None
+        self._proxy_loop_ready.clear()
+        if loop is None:
+            return
+
+        try:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.5)
+
+        try:
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
+
+    def _run_proxy_coroutine(self, coro_factory: Callable[[], Awaitable[Any]], timeout: float = 15.0):
+        last_error: Optional[Exception] = None
+
+        for _ in range(2):
+            self._ensure_proxy_loop()
+            loop = self._proxy_loop
+            if loop is None or loop.is_closed():
+                self._shutdown_proxy_loop()
+                continue
+            try:
+                future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+                return future.result(timeout=timeout)
+            except TimeoutError:
+                future.cancel()
+                raise TimeoutError("本地代理请求超时")
+            except RuntimeError as e:
+                # loop 可能在并发关闭过程中失效，重建后重试一次
+                last_error = e
+                self._shutdown_proxy_loop()
+                continue
+
+        if last_error is not None:
+            raise RuntimeError(f"本地代理调用失败: {last_error}")
+        raise RuntimeError("本地代理调用失败")
 
     def _hide_to_tray(self, show_notice: bool = True):
         if not self.tray_icon:
@@ -1173,13 +1251,7 @@ class MainWindow(QMainWindow):
             return payload
 
         proxy = get_proxy()
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            payload = loop.run_until_complete(proxy.get_account_pool_status())
-        finally:
-            loop.close()
-            asyncio.set_event_loop(None)
+        payload = self._run_proxy_coroutine(lambda: proxy.get_account_pool_status(), timeout=10.0)
 
         if not isinstance(payload, dict):
             raise ValueError("账号池数据返回格式错误")
@@ -1216,7 +1288,7 @@ class MainWindow(QMainWindow):
         payload = dict(credentials)
         payload["account_id"] = account_id
         payload["enabled"] = True
-        payload["weight"] = int(payload.get("weight") or 1)
+        payload["priority"] = int(payload.get("priority") or 0)
         file_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
         return account_id, str(file_path)
@@ -1234,13 +1306,7 @@ class MainWindow(QMainWindow):
                 payload = response.json()
             else:
                 proxy = get_proxy()
-                loop = asyncio.new_event_loop()
-                try:
-                    asyncio.set_event_loop(loop)
-                    payload = loop.run_until_complete(proxy.get_models())
-                finally:
-                    loop.close()
-                    asyncio.set_event_loop(None)
+                payload = self._run_proxy_coroutine(lambda: proxy.get_models(), timeout=12.0)
 
             model_ids: List[str] = []
             data = payload.get("data", [])

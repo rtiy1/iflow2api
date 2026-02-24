@@ -49,6 +49,8 @@ EXTRA_MODELS = [
 CREDENTIAL_POOL_RELOAD_INTERVAL = 5.0
 ACCOUNT_COOLDOWN_BASE_SECONDS = 30.0
 ACCOUNT_COOLDOWN_MAX_SECONDS = 300.0
+ROUTING_STRATEGY_ROUND_ROBIN = "round-robin"
+ROUTING_STRATEGY_FILL_FIRST = "fill-first"
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -341,13 +343,27 @@ def _parse_positive_int(value: Any, default: int = 1) -> int:
     return parsed if parsed > 0 else default
 
 
+def _parse_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _normalize_routing_strategy(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"fill-first", "fill_first", "fillfirst"}:
+        return ROUTING_STRATEGY_FILL_FIRST
+    return ROUTING_STRATEGY_ROUND_ROBIN
+
+
 @dataclass
 class CredentialAccount:
     account_id: str
     api_key: str
     file_path: str = ""
     enabled: bool = True
-    weight: int = 1
+    priority: int = 0
     token_storage: Optional[IFlowTokenStorage] = None
     cooldown_until: float = 0.0
     failure_count: int = 0
@@ -802,11 +818,13 @@ class ReverseProxy:
         api_key: str,
         token_file_path: Optional[str] = None,
         creds_dir: Optional[str] = None,
+        routing_strategy: str = ROUTING_STRATEGY_ROUND_ROBIN,
     ):
         self.upstream_url = upstream_url.rstrip("/")
         self.api_key = api_key
         self.token_file_path = token_file_path
         self.creds_dir = creds_dir
+        self.routing_strategy = _normalize_routing_strategy(routing_strategy)
         self.token_storage: Optional[IFlowTokenStorage] = None
         self._client: Optional[httpx.AsyncClient] = None
         self._single_refresh_lock = asyncio.Lock()
@@ -814,7 +832,7 @@ class ReverseProxy:
         self._account_refresh_locks: Dict[str, asyncio.Lock] = {}
         self._accounts: Dict[str, CredentialAccount] = {}
         self._account_order: List[str] = []
-        self._rr_cursor = 0
+        self._rr_cursors: Dict[str, int] = {}
         self._pool_last_loaded_at = 0.0
 
     async def initialize(self):
@@ -890,13 +908,17 @@ class ReverseProxy:
             raw["apiKey"] = api_key
         token_storage = IFlowTokenStorage(raw)
         enabled = _parse_bool(raw.get("enabled"), default=True)
-        weight = _parse_positive_int(raw.get("weight"), default=1)
+        attributes = raw.get("attributes") if isinstance(raw.get("attributes"), dict) else {}
+        priority = _parse_int(
+            raw.get("priority", attributes.get("priority")),
+            default=_parse_int(raw.get("weight"), default=0),
+        )
         return CredentialAccount(
             account_id=account_id,
             api_key=api_key,
             file_path=str(file_path),
             enabled=enabled,
-            weight=weight,
+            priority=priority,
             token_storage=token_storage,
         )
 
@@ -938,32 +960,47 @@ class ReverseProxy:
             self._accounts = new_accounts
             self._account_order = sorted(new_accounts.keys())
             self._pool_last_loaded_at = now_ts
-            if self._rr_cursor >= len(self._account_order):
-                self._rr_cursor = 0
+            valid_route_keys = list(self._rr_cursors.keys())
+            for route_key in valid_route_keys:
+                cursor = self._rr_cursors.get(route_key, 0)
+                if cursor < 0:
+                    self._rr_cursors[route_key] = 0
             return len(self._account_order) > 0
 
-    async def _get_available_pool_account_id(self) -> Optional[str]:
+    async def _get_available_pool_account_id(self, route_key: str = "*") -> Optional[str]:
         async with self._pool_lock:
             if not self._account_order:
                 return None
             now_ts = time.time()
-            weighted_ids: List[str] = []
+            available_accounts: List[CredentialAccount] = []
             for account_id in self._account_order:
                 account = self._accounts.get(account_id)
                 if account is None or not account.is_available(now_ts):
                     continue
-                repeat = min(max(1, account.weight), 100)
-                weighted_ids.extend([account_id] * repeat)
-            if not weighted_ids:
+                available_accounts.append(account)
+
+            if not available_accounts:
                 return None
-            index = self._rr_cursor % len(weighted_ids)
-            self._rr_cursor = (self._rr_cursor + 1) % max(len(weighted_ids), 1)
-            selected_id = weighted_ids[index]
-            account = self._accounts.get(selected_id)
-            if account is not None:
-                account.selected_count += 1
-                account.last_selected_at = now_ts
-            return selected_id
+
+            max_priority = max(acc.priority for acc in available_accounts)
+            candidates = [acc for acc in available_accounts if acc.priority == max_priority]
+            candidates.sort(key=lambda acc: acc.account_id)
+            if not candidates:
+                return None
+
+            selected: CredentialAccount
+            if self.routing_strategy == ROUTING_STRATEGY_FILL_FIRST:
+                selected = candidates[0]
+            else:
+                key = route_key or "*"
+                cursor = self._rr_cursors.get(key, 0)
+                index = cursor % len(candidates)
+                self._rr_cursors[key] = (cursor + 1) % len(candidates)
+                selected = candidates[index]
+
+            selected.selected_count += 1
+            selected.last_selected_at = now_ts
+            return selected.account_id
 
     async def _ensure_pool_account_fresh(self, account_id: str) -> Optional[CredentialAccount]:
         async with self._pool_lock:
@@ -1034,10 +1071,10 @@ class ReverseProxy:
                 current.last_error = ""
                 return copy.deepcopy(current)
 
-    async def _select_account(self) -> CredentialAccount:
+    async def _select_account(self, route_key: str = "*") -> CredentialAccount:
         has_pool = await self._reload_account_pool_if_needed()
         if has_pool:
-            account_id = await self._get_available_pool_account_id()
+            account_id = await self._get_available_pool_account_id(route_key=route_key)
             if account_id is None:
                 raise RuntimeError("no credential available")
             account = await self._ensure_pool_account_fresh(account_id)
@@ -1092,6 +1129,7 @@ class ReverseProxy:
             return {
                 "mode": "single",
                 "creds_dir": self.creds_dir or "",
+                "routing_strategy": self.routing_strategy,
                 "total_accounts": 1 if self.api_key else 0,
                 "available_accounts": 1 if self.api_key else 0,
                 "accounts": [
@@ -1099,7 +1137,8 @@ class ReverseProxy:
                         "account_id": "default",
                         "enabled": bool(self.api_key),
                         "available": bool(self.api_key),
-                        "weight": 1,
+                        "priority": 0,
+                        "weight": 0,
                         "failure_count": 0,
                         "cooldown_seconds": 0,
                         "last_error": "",
@@ -1121,7 +1160,8 @@ class ReverseProxy:
                         "account_id": account.account_id,
                         "enabled": account.enabled,
                         "available": account.is_available(now_ts),
-                        "weight": account.weight,
+                        "priority": account.priority,
+                        "weight": account.priority,
                         "failure_count": account.failure_count,
                         "cooldown_seconds": cooldown_seconds,
                         "selected_count": account.selected_count,
@@ -1136,9 +1176,10 @@ class ReverseProxy:
             return {
                 "mode": "pool",
                 "creds_dir": self.creds_dir or "",
+                "routing_strategy": self.routing_strategy,
                 "total_accounts": len(accounts_payload),
                 "available_accounts": available_count,
-                "cursor": self._rr_cursor,
+                "cursor": self._rr_cursors,
                 "accounts": accounts_payload,
             }
 
@@ -1270,7 +1311,8 @@ class ReverseProxy:
 
         client = await self._get_client()
         try:
-            account = await self._select_account()
+            route_key = f"{endpoint}:{model or '*'}"
+            account = await self._select_account(route_key=route_key)
         except RuntimeError as exc:
             request = client.build_request("POST", f"{self.upstream_url}{endpoint}", json=body)
             raise _build_http_status_error(503, str(exc), request)
@@ -1645,7 +1687,7 @@ class ReverseProxy:
         """获取模型列表"""
         client = await self._get_client()
         try:
-            account = await self._select_account()
+            account = await self._select_account(route_key="/models:*")
         except RuntimeError as exc:
             request = client.build_request("GET", f"{self.upstream_url}/models")
             raise _build_http_status_error(503, str(exc), request)
@@ -1683,5 +1725,12 @@ def get_proxy() -> ReverseProxy:
     if _proxy is None:
         token_file = CONFIG.get("token_file_path")
         creds_dir = CONFIG.get("creds_dir")
-        _proxy = ReverseProxy(CONFIG["base_url"], CONFIG["api_key"], token_file, creds_dir=creds_dir)
+        routing_strategy = CONFIG.get("routing_strategy", ROUTING_STRATEGY_ROUND_ROBIN)
+        _proxy = ReverseProxy(
+            CONFIG["base_url"],
+            CONFIG["api_key"],
+            token_file,
+            creds_dir=creds_dir,
+            routing_strategy=routing_strategy,
+        )
     return _proxy

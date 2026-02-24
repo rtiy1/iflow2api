@@ -591,6 +591,7 @@ async def admin_page():
             <div class="card">
                 <div class="account-summary">
                     <span class="summary-chip">模式<strong id="accounts-mode">-</strong></span>
+                    <span class="summary-chip">策略<strong id="accounts-strategy">-</strong></span>
                     <span class="summary-chip">总账号<strong id="accounts-total">0</strong></span>
                     <span class="summary-chip">可用账号<strong id="accounts-available">0</strong></span>
                 </div>
@@ -822,11 +823,13 @@ async def admin_page():
                 const payload = await res.json();
 
                 const mode = payload.mode || '-';
+                const strategy = payload.routing_strategy || '-';
                 const total = payload.total_accounts ?? 0;
                 const available = payload.available_accounts ?? 0;
                 const rows = Array.isArray(payload.accounts) ? payload.accounts : [];
 
                 document.getElementById('accounts-mode').textContent = mode;
+                document.getElementById('accounts-strategy').textContent = strategy;
                 document.getElementById('accounts-total').textContent = String(total);
                 document.getElementById('accounts-available').textContent = String(available);
 
@@ -850,7 +853,7 @@ async def admin_page():
                     }
 
                     const accountId = escapeHtml(String(row.account_id || 'unknown'));
-                    const weight = Number(row.weight || 1);
+                    const priority = Number(row.priority || 0);
                     const selectedCount = Number(row.selected_count || 0);
                     const failureCount = Number(row.failure_count || 0);
                     const fileName = escapeHtml(String(row.file || ''));
@@ -863,7 +866,7 @@ async def admin_page():
                                 <span class="account-status ${statusClass}">${statusText}</span>
                             </div>
                             <div class="account-meta">
-                                <span>weight: ${weight}</span>
+                                <span>priority: ${priority}</span>
                                 <span>selected: ${selectedCount}</span>
                                 <span>failures: ${failureCount}</span>
                                 <span>file: ${fileName || '-'}</span>
