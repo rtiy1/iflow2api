@@ -103,6 +103,12 @@ GUI 行为：
 
 ### 6.5 启动 Agent（无 GUI）
 
+无参数直接启动（适合双击 `iflow2api-agent.exe`）：
+
+```bash
+python iflow_agent.py
+```
+
 前台运行：
 
 ```bash
@@ -114,6 +120,9 @@ python iflow_agent.py run --port 8000
 ```bash
 python iflow_agent.py start --port 8000
 ```
+
+首次在 Windows 执行 `run` 或 `start` 时，Agent 会弹出一次确认，询问是否启用开机自启（登录触发计划任务）。  
+如果选择“否”，后续不会重复提示，可随时手动执行 `install-autostart` 启用。
 
 查看状态：
 
@@ -139,9 +148,10 @@ python iflow_agent.py install-autostart --port 8000
 python iflow_agent.py uninstall-autostart
 ```
 
-用户可用一键停止脚本：
+用户可用一键停止并关闭自启脚本：
 
 - `stop_iflow2api.bat`
+- 脚本行为：先执行 `stop`，再执行 `uninstall-autostart`
 
 ## 7. 关键配置项
 
@@ -216,6 +226,10 @@ python build_agent.py
 
 - `dist/iflow2api-gui.exe`
 - `dist/iflow2api-agent.exe`
+
+说明：
+
+- 双击 `dist/iflow2api-agent.exe`（无参数）会默认后台启动（等价 `start --port 8000`）
 
 ## 10. GitHub Actions 自动构建与 Release
 
